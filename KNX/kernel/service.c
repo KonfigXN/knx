@@ -79,7 +79,7 @@ static int start_devices(knx_boot_info *info) {
 }
 static int start_interrupts(knx_boot_info *info) {
     (void)info;
-    knx_log("[INT]", "Configuring PIC and timer interrupts...");
+    knx_log("[INT]", "Configuring GIC and timer interrupts...");
     knx_interrupts_init();
     knx_log("[INT]", "Interrupt controller initialized");
     return 1;

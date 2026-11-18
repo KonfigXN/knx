@@ -1,5 +1,11 @@
 #include "knx.h"
 
+/*
+ * AArch64 network stack: the RTL8139 port-I/O driver has been removed (there
+ * is no I/O-port space on AArch64).  The e1000 MMIO driver and the ARP/IP/
+ * ICMP/UDP protocol stack are unchanged.
+ */
+
 static void *mcpy(void *d, const void *s, uint64_t n) {
     uint8_t *a = (uint8_t *)d;
     const uint8_t *b = (const uint8_t *)s;
@@ -86,166 +92,11 @@ void knx_net_tick(void) {
     net_poll();
 }
 
-static int  rtl_send(const void *frame, uint64_t len);
-static void rtl_poll(void);
-static int  rtl_link_up(void);
 static int  e1000_send(const void *frame, uint64_t len);
 static void e1000_poll(void);
 static int  e1000_link_up(void);
 
-static const knx_netdev_ops rtl_ops = { rtl_send, rtl_poll, rtl_link_up };
 static const knx_netdev_ops e1000_ops = { e1000_send, e1000_poll, e1000_link_up };
-
-#define RTL_MAC0     0x00
-#define RTL_TSD0     0x10
-#define RTL_TSAD0    0x20
-#define RTL_RBSTART  0x30
-#define RTL_CAPR     0x38
-#define RTL_CBR      0x3A
-#define RTL_IMR      0x3C
-#define RTL_ISR      0x3E
-#define RTL_TCR      0x40
-#define RTL_RCR      0x44
-#define RTL_CONFIG1  0x52
-#define RTL_MSR      0x58
-#define RTL_CR       0x37
-
-#define RTL_CR_RESET 0x10
-#define RTL_CR_RXEN  0x08
-#define RTL_CR_TXEN  0x04
-#define RTL_CR_BUFE  0x01
-
-#define RTL_ISR_TOK  0x04
-#define RTL_ISR_TER  0x08
-
-#define RTL_MSR_LINKFAIL 0x04
-
-#define RTL_RX_RING 8192u
-
-static uint8_t rtl_rxbuf[RTL_RX_RING + 16] __attribute__((aligned(16)));
-static uint8_t rtl_txbuf[1514 + 8] __attribute__((aligned(16)));
-static uint16_t rtl_io;
-static uint16_t rtl_rxread;
-static uint8_t rtl_mac[ETH_ALEN];
-static int rtl_present;
-
-static int rtl_link_up(void) {
-    if (!rtl_present || !rtl_io)
-        return 0;
-    return !(knx_io_in8(rtl_io + RTL_MSR) & RTL_MSR_LINKFAIL);
-}
-
-static int rtl_send(const void *data, uint64_t len) {
-    if (!rtl_present || !data || len == 0 || len > 1514)
-        return -1;
-
-    unsigned n = (unsigned)len;
-
-    if (n < 60)
-        n = 60;
-    for (unsigned i = 0; i < n; ++i)
-        rtl_txbuf[i] = (i < len) ? ((const uint8_t *)data)[i] : 0;
-
-    knx_io_out16(rtl_io + RTL_ISR, RTL_ISR_TOK | RTL_ISR_TER);
-    knx_io_out32(rtl_io + RTL_TSAD0, (uint32_t)(uintptr_t)rtl_txbuf);
-    knx_io_out32(rtl_io + RTL_TSD0, n);
-
-    for (unsigned i = 0; i < 200000; ++i) {
-        uint16_t isr = knx_io_in16(rtl_io + RTL_ISR);
-        uint16_t ack = (uint16_t)(isr & (RTL_ISR_TOK | RTL_ISR_TER));
-        if (!ack)
-            continue;
-        knx_io_out16(rtl_io + RTL_ISR, ack);
-        if (ack & RTL_ISR_TER)
-            return -1;
-        if (ack & RTL_ISR_TOK)
-            return (int)len;
-    }
-    return -1;
-}
-
-static void rtl_poll(void) {
-    if (!rtl_present || !rtl_io)
-        return;
-
-    for (unsigned guard = 0; guard < 512; ++guard) {
-        if (knx_io_in8(rtl_io + RTL_CR) & RTL_CR_BUFE)
-            break;
-        if ((uint32_t)rtl_rxread + 4u > RTL_RX_RING) {
-            rtl_rxread = 0;
-            knx_io_out16(rtl_io + RTL_CAPR, 0xFFF0);
-            break;
-        }
-
-        uint16_t status = *(const volatile uint16_t *)(rtl_rxbuf + rtl_rxread);
-        uint16_t rxsize = *(const volatile uint16_t *)(rtl_rxbuf + rtl_rxread + 2);
-
-        if (rxsize >= 4 && rxsize <= 2048 &&
-            (status & 0x0001) && !(status & 0x003E)) {
-            net_handle_packet(rtl_rxbuf + rtl_rxread + 4, (uint64_t)(rxsize - 4));
-        }
-
-        rtl_rxread = (uint16_t)((rtl_rxread + rxsize + 4 + 3) & ~3u);
-        if (rxsize < 4 || rxsize > 2048)
-            rtl_rxread = 0;
-        if (rtl_rxread >= RTL_RX_RING)
-            rtl_rxread = (uint16_t)(rtl_rxread - RTL_RX_RING);
-
-        uint32_t capr = rtl_rxread ? ((uint32_t)rtl_rxread - 0x10u) : 0xFFF0u;
-        knx_io_out16(rtl_io + RTL_CAPR, (uint16_t)capr);
-    }
-}
-
-int knx_rtl8139_probe(const knx_pci_device *device) {
-    if (!device || g_netdev.present || rtl_present)
-        return 0;
-    if (device->vendor_id != 0x10EC ||
-        (device->device_id != 0x8139 && device->device_id != 0x8138))
-        return 0;
-
-    uint32_t bar = device->bar[0];
-    if (!(bar & 1u))
-        bar = device->bar[1];
-    uint32_t io32 = bar & ~3u;
-    if (!(bar & 1u) || io32 == 0 || io32 > 0xffffu)
-        return 0;
-    uint16_t io = (uint16_t)io32;
-
-    if (knx_pci_enable_device(device, KNX_PCI_ENABLE_IO | KNX_PCI_ENABLE_BUS_MASTER) != 0)
-        return 0;
-
-    rtl_io = io;
-
-    knx_io_out8(io + RTL_CONFIG1, 0x00);
-
-    knx_io_out8(io + RTL_CR, RTL_CR_RESET);
-    for (unsigned i = 0; i < 100000; ++i) {
-        if (!(knx_io_in8(io + RTL_CR) & RTL_CR_RESET))
-            break;
-    }
-    if (knx_io_in8(io + RTL_CR) & RTL_CR_RESET) {
-        rtl_io = 0;
-        return 0;
-    }
-
-    for (unsigned i = 0; i < ETH_ALEN; ++i)
-        rtl_mac[i] = knx_io_in8(io + RTL_MAC0 + i);
-
-    mset(rtl_rxbuf, 0, sizeof(rtl_rxbuf));
-    knx_io_out32(io + RTL_RBSTART, (uint32_t)(uintptr_t)rtl_rxbuf);
-    knx_io_out16(io + RTL_CAPR, 0);
-    knx_io_out16(io + RTL_IMR, 0);
-
-    knx_io_out32(io + RTL_TCR, 0x03000700u);
-    knx_io_out32(io + RTL_RCR, 0x0000008Fu);
-    knx_io_out8(io + RTL_CR, RTL_CR_RXEN | RTL_CR_TXEN);
-
-    rtl_rxread = 0;
-    rtl_present = 1;
-    netdev_register("RTL8139", rtl_mac, &rtl_ops);
-    knx_log("[RTL8139]", "Initialized");
-    return 1;
-}
 
 #define E1000_CTRL   0x0000
 #define E1000_STATUS 0x0008
@@ -321,12 +172,12 @@ static int e1000_present;
 
 static uint32_t e1000_read(unsigned reg) {
     uint32_t v = e1000_mmio[reg / 4];
-    __asm__ volatile("" ::: "memory");
+    knx_dmb();
     return v;
 }
 static void e1000_write(unsigned reg, uint32_t v) {
     e1000_mmio[reg / 4] = v;
-    __asm__ volatile("" ::: "memory");
+    knx_dmb();
 }
 
 static int e1000_link_up(void) {
@@ -343,6 +194,7 @@ static int e1000_send(const void *data, uint64_t len) {
     for (unsigned i = 0; i < 1000000; ++i) {
         if (d->status & E_DD)
             break;
+        knx_pause();
     }
     if (!(d->status & E_DD))
         return -1;
@@ -360,7 +212,7 @@ static int e1000_send(const void *data, uint64_t len) {
     d->special = 0;
     d->cmd = E_TX_EOP | E_TX_IFCS | E_TX_RS;
     d->status = 0;
-    __asm__ volatile("" ::: "memory");
+    knx_dmb();
     e1000_write(E1000_TDT, (e1000_txcur + 1) % E1000_NTX);
 
     for (unsigned i = 0; i < 1000000; ++i) {
@@ -368,6 +220,7 @@ static int e1000_send(const void *data, uint64_t len) {
             e1000_txcur = (e1000_txcur + 1) % E1000_NTX;
             return (int)len;
         }
+        knx_pause();
     }
     return -1;
 }
@@ -385,7 +238,7 @@ static void e1000_poll(void) {
             net_handle_packet(e1000_rxbuf[e1000_rxcur], len);
         d->status = 0;
         d->length = 0;
-        __asm__ volatile("" ::: "memory");
+        knx_dmb();
 
         e1000_write(E1000_RDT, e1000_rxcur);
         e1000_rxcur = (e1000_rxcur + 1) % E1000_NRX;
@@ -417,6 +270,7 @@ int knx_e1000_probe(const knx_pci_device *device) {
     for (unsigned i = 0; i < 100000; ++i) {
         if (!(e1000_read(E1000_CTRL) & E_CTRL_RST))
             break;
+        knx_pause();
     }
     e1000_write(E1000_IMC, 0xffffffffu);
     (void)e1000_read(E1000_ICR);
@@ -472,7 +326,7 @@ int knx_e1000_probe(const knx_pci_device *device) {
 
     e1000_present = 1;
     netdev_register("e1000", e1000_mac, &e1000_ops);
-    knx_log("[e1000]", "Initialized");
+    knx_log("[e1000]", "Initialized (MMIO)");
     return 1;
 }
 
@@ -566,7 +420,6 @@ static void net_handle_arp(const uint8_t *pkt, uint64_t len) {
     arp_cache_put(spa, sha);
 
     if (oper == 1 && tpa == htonl32(net_ip)) {
-
         uint8_t frame[60];
         mset(frame, 0, sizeof(frame));
         mcpy(frame, sha, ETH_ALEN);
@@ -684,7 +537,7 @@ static void net_handle_packet(const uint8_t *pkt, uint64_t len) {
 }
 
 void knx_net_init(void) {
-
+    knx_log("[NET]", "RTL8139 is not supported on AArch64; e1000 MMIO only");
 }
 
 int knx_net_parse_ip(const char *text, uint32_t *out) {
@@ -745,12 +598,12 @@ static int arp_resolve(uint32_t ip_host) {
         net_poll();
         if (arp_cache_get(ipn, mac))
             return 0;
+        knx_pause();
     }
     return -1;
 }
 
 static uint32_t resolve_dst_mac_host(uint32_t dst_ip_host) {
-
     uint32_t ipn = htonl32(dst_ip_host);
     uint32_t netipn = htonl32(net_ip);
     uint32_t maskn = htonl32(net_mask);
@@ -760,7 +613,6 @@ static uint32_t resolve_dst_mac_host(uint32_t dst_ip_host) {
 }
 
 void knx_net_ping(uint32_t target_hostip) {
-
     uint32_t target_host = htonl32(target_hostip);
     if (!g_netdev.present) {
         knx_puts("No network interface.\n");
@@ -813,8 +665,10 @@ void knx_net_ping(uint32_t target_hostip) {
 
     uint64_t start = knx_ticks();
     uint64_t deadline = start + 200;
-    while (knx_ticks() < deadline && !ping_done)
+    while (knx_ticks() < deadline && !ping_done) {
         net_poll();
+        knx_pause();
+    }
     if (ping_done) {
         knx_puts("ping: reply from target in ");
         knx_print_u64(knx_ticks() - start);
@@ -948,7 +802,7 @@ void knx_net_netstat(void) {
 void knx_net_info(void) {
     knx_puts("Network: ");
     if (!g_netdev.present)
-        knx_puts("no Ethernet controller\n");
+        knx_puts("no Ethernet controller (RTL8139 unsupported; e1000 MMIO only)\n");
     else {
         knx_puts(g_netdev.name);
         knx_puts(" present, link ");

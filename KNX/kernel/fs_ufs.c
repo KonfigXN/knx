@@ -1,16 +1,18 @@
 #include "knx.h"
 #include "ufs.h"
 
-#define ATA_PRIMARY 0x1f0
-#define ATA_SECONDARY 0x170
+/*
+ * UFS1 reader.  The ATA/IDE PIO path (ports 0x1f0/0x170/0x3f6) is gone: there
+ * is no such controller on AArch64.  The UEFI loader supplies the root image
+ * in memory via knx_boot_info.initrd_base, which main.c registers with
+ * knx_ufs_memdisk(); that path is fully preserved below.
+ */
+
 #define UFS_SECTOR 512
 #define UFS_FSB 4096
 #define UFS_SECTORS_PER_FSB (UFS_FSB / UFS_SECTOR)
 #define UFS_MAX_VNODES 32
 
-static uint16_t ufs_ata_base = ATA_PRIMARY;
-static uint16_t ufs_ata_control = 0x3f6;
-static uint8_t ufs_ata_drive = 0xe0;
 static uint32_t ufs_part_lba;
 static int ufs_mounted;
 static const uint8_t *ufs_memdisk;
@@ -37,55 +39,16 @@ static struct {
     uint32_t magic;
 } ufs_sb;
 
-static inline void u_outb(uint16_t port, uint8_t value) {
-    __asm__ volatile("outb %0,%1" : : "a"(value), "Nd"(port));
-}
-static inline uint8_t u_inb(uint16_t port) {
-    uint8_t value;
-    __asm__ volatile("inb %1,%0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-static inline uint16_t u_inw(uint16_t port) {
-    uint16_t value;
-    __asm__ volatile("inw %1,%0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-static int u_wait_drq(void) {
-    for (unsigned i = 0; i < 1000000; ++i) {
-        uint8_t status = u_inb(ufs_ata_base + 7);
-        if (status == 0 || status == 0xff || (status & 1))
-            return 0;
-        if (!(status & 0x80) && (status & 8))
-            return 1;
-        (void)u_inb(ufs_ata_control);
-    }
-    return 0;
-}
-static int u_ata_read(uint32_t lba, uint8_t *buffer) {
-    if (ufs_memdisk) {
-        uint64_t offset = (uint64_t)lba * UFS_SECTOR;
-        if (offset + UFS_SECTOR > ufs_memdisk_size)
-            return 0;
-        const uint8_t *src = ufs_memdisk + offset;
-        for (unsigned i = 0; i < UFS_SECTOR; ++i)
-            buffer[i] = src[i];
-        return 1;
-    }
-    if (lba >= (1u << 28))
+/* The only backing store is the in-memory image handed over by the loader. */
+static int ufs_read_sector(uint32_t lba, uint8_t *buffer) {
+    if (!ufs_memdisk)
         return 0;
-    u_outb(ufs_ata_base + 6, (uint8_t)(ufs_ata_drive | ((lba >> 24) & 0x0f)));
-    for (unsigned i = 0; i < 4; ++i)
-        (void)u_inb(ufs_ata_control);
-    u_outb(ufs_ata_base + 2, 1);
-    u_outb(ufs_ata_base + 3, (uint8_t)lba);
-    u_outb(ufs_ata_base + 4, (uint8_t)(lba >> 8));
-    u_outb(ufs_ata_base + 5, (uint8_t)(lba >> 16));
-    u_outb(ufs_ata_base + 7, 0x20);
-    if (!u_wait_drq())
+    uint64_t offset = (uint64_t)lba * UFS_SECTOR;
+    if (offset + UFS_SECTOR > ufs_memdisk_size)
         return 0;
-    uint16_t *words = (uint16_t *)buffer;
-    for (unsigned i = 0; i < 256; ++i)
-        words[i] = u_inw(ufs_ata_base);
+    const uint8_t *src = ufs_memdisk + offset;
+    for (unsigned i = 0; i < UFS_SECTOR; ++i)
+        buffer[i] = src[i];
     return 1;
 }
 
@@ -94,10 +57,11 @@ static int u_read_fsb(int32_t fsb, uint8_t *buf) {
         return 0;
     uint32_t start = ufs_part_lba + (uint32_t)fsb * UFS_SECTORS_PER_FSB;
     for (unsigned i = 0; i < UFS_SECTORS_PER_FSB; ++i)
-        if (!u_ata_read(start + i, buf + i * UFS_SECTOR))
+        if (!ufs_read_sector(start + i, buf + i * UFS_SECTOR))
             return 0;
     return 1;
 }
+
 static uint32_t rd32(const uint8_t *p, unsigned off) {
     return (uint32_t)p[off] | ((uint32_t)p[off + 1] << 8) | ((uint32_t)p[off + 2] << 16) |
            ((uint32_t)p[off + 3] << 24);
@@ -172,7 +136,6 @@ static int u_name_eq_elf(const char *a, const unsigned char *b, unsigned blen) {
 
 static struct knx_vnode *u_alloc_vnode(uint32_t ino, uint32_t type) {
     for (unsigned i = 0; i < UFS_MAX_VNODES; ++i) {
-
         if (ufs_vnodes[i].ops == &ufs_vfs_ops && ufs_priv[i].ino == ino) {
             ufs_vnodes[i].type = type;
             return &ufs_vnodes[i];
@@ -332,7 +295,6 @@ static int ufs_stat(struct knx_vnode *node, struct knx_vfs_stat *stat) {
 }
 
 static int u_bmap(const struct ufs1_dinode *din, uint64_t lbn, int32_t *out) {
-
     uint64_t nind = ufs_sb.nindir ? ufs_sb.nindir : UFS_NINDIR;
     if (lbn < UFS_NDADDR) {
         *out = din->di_db[lbn];
@@ -362,7 +324,6 @@ static int u_bmap(const struct ufs1_dinode *din, uint64_t lbn, int32_t *out) {
         *out = (int32_t)rd32(fib, idx * 4);
         return *out ? 0 : -1;
     }
-
     return -1;
 }
 
@@ -467,12 +428,11 @@ static void u_save_sb(const uint8_t *sb) {
 }
 
 static int u_try_partition(uint32_t part_lba, uint32_t part_sectors) {
-
     if (part_sectors < UFS_SBLOCK_SECTORS + 3)
         return 0;
     uint8_t sb[1536] __attribute__((aligned(16)));
     for (unsigned i = 0; i < 3; ++i)
-        if (!u_ata_read(part_lba + UFS_SBLOCK_SECTORS + i, sb + i * UFS_SECTOR))
+        if (!ufs_read_sector(part_lba + UFS_SBLOCK_SECTORS + i, sb + i * UFS_SECTOR))
             return 0;
     if (!u_parse_sb(sb))
         return 0;
@@ -487,49 +447,23 @@ static int u_try_partition(uint32_t part_lba, uint32_t part_sectors) {
 }
 
 void knx_ufs_init(void) {
-    uint8_t sector[UFS_SECTOR] __attribute__((aligned(16)));
     ufs_mounted = 0;
-    if (ufs_memdisk) {
-        uint32_t sectors = (uint32_t)(ufs_memdisk_size / UFS_SECTOR);
-        knx_puts("UFS: bootloader-supplied RAM image, ");
-        knx_print_u64(ufs_memdisk_size / 1024);
-        knx_puts(" KiB\n");
-        if (sectors >= 64 && u_try_partition(0, sectors))
-            goto mounted;
+    if (!ufs_memdisk) {
+        knx_puts("UFS: no bootloader-supplied RAM image available\n");
+        return;
+    }
+    uint32_t sectors = (uint32_t)(ufs_memdisk_size / UFS_SECTOR);
+    knx_puts("UFS: bootloader-supplied RAM image, ");
+    knx_print_u64(ufs_memdisk_size / 1024);
+    knx_puts(" KiB\n");
+    if (sectors < 64 || !u_try_partition(0, sectors)) {
         knx_puts("UFS: RAM image is not a UFS1 volume\n");
         return;
     }
-    for (unsigned device = 0; device < 4; ++device) {
-        ufs_ata_base = device < 2 ? ATA_PRIMARY : ATA_SECONDARY;
-        ufs_ata_control = device < 2 ? 0x3f6 : 0x376;
-        ufs_ata_drive = (device & 1) ? 0xf0 : 0xe0;
-        if (!u_ata_read(0, sector))
-            continue;
-        if (sector[510] == 0x55 && sector[511] == 0xaa) {
-            for (unsigned p = 0; p < 4; ++p) {
-                unsigned entry = 446 + p * 16;
-                uint32_t part_start = rd32(sector, entry + 8);
-                uint32_t part_size = rd32(sector, entry + 12);
-                if (!part_start || part_size < 64 || part_start >= (1u << 28) ||
-                    part_size > (1u << 28) - part_start)
-                    continue;
-                if (u_try_partition(part_start, part_size))
-                    goto mounted;
-            }
-        } else {
 
-            if (u_try_partition(0, 1u << 28))
-                goto mounted;
-        }
-    }
-    knx_puts("UFS not mounted, KFS is root (fallback)\n");
-    return;
-mounted:
     ufs_mounted = 1;
-
-    for (unsigned i = 0; i < UFS_MAX_VNODES; ++i) {
+    for (unsigned i = 0; i < UFS_MAX_VNODES; ++i)
         ufs_vnodes[i].ops = 0;
-    }
     ufs_root_priv.ino = UFS_ROOTINO;
     ufs_root_vnode.private_data = &ufs_root_priv;
     ufs_root_vnode.inode = UFS_ROOTINO;

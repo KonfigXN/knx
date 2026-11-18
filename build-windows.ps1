@@ -42,9 +42,13 @@ $llvmBin = Get-ToolPath 'KNX_LLVM_BIN' `
     'C:\Program Files\LLVM\bin' 'LLVM bin directory'
 $rustBin = Get-ToolPath 'KNX_RUST_BIN' `
     'C:\Program Files\Rust stable MSVC 1.99\bin' 'Rust bin directory'
-$rustSysroot = Get-ToolPath 'KNX_RUST_SYSROOT' `
-    'C:\Users\Konfig\knx-work\rust-std-extract\rust-std-1.99.1-x86_64-unknown-none\rust-std-x86_64-unknown-none' `
-    'Rust x86_64-unknown-none sysroot'
+# Rust is currently compiled through a C fallback (kernel/rust_stub.c), so an
+# aarch64-unknown-none sysroot is optional.  If one is installed, point
+# KNX_RUST_SYSROOT at it when the Rust build is re-enabled.
+$rustSysroot = [Environment]::GetEnvironmentVariable('KNX_RUST_SYSROOT')
+if (-not $rustSysroot) {
+    $rustSysroot = 'C:\Users\Konfig\knx-work\rust-std-extract\rust-std-1.99.1-aarch64-unknown-none\rust-std-aarch64-unknown-none'
+}
 
 $bash = Join-Path $msysRoot 'usr\bin\bash.exe'
 if (-not (Test-Path -LiteralPath $bash)) {
@@ -59,7 +63,9 @@ $env:PATH = @(
     $env:PATH
 ) -join ';'
 $env:KNX_ROOT = $repoRoot
-$env:KNX_RUST_SYSROOT = $rustSysroot
+if (Test-Path -LiteralPath $rustSysroot) {
+    $env:KNX_RUST_SYSROOT = $rustSysroot
+}
 
 $buildDir = "build/$Profile"
 switch ($Command) {

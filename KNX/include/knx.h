@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "knx_vfs.h"
+#include "knx_arch.h"
 #include "knx_syscall.h"
 #define KNX_BOOT_MAGIC 0x31544f4f42584e4bULL
 #define KNX_BOOT_VERSION 4u
@@ -10,7 +11,7 @@
 #define KNX_BOOT_CONSOLE  0x2u
 #define KNX_BOOT_VERBOSE  0x4u
 
-#define KNX_FLIGHT_PHYS 0x00070000ULL
+#define KNX_FLIGHT_PHYS 0x40070000ULL
 #define KNX_FLIGHT_MAGIC 0x31474f4c4b4e584bULL
 #define KNX_FLIGHT_DATA 0x20000u
 struct knx_flight_header {
@@ -24,7 +25,6 @@ struct knx_flight_header {
 #define KNX_MEMORY_USABLE 1u
 #define KNX_MEMORY_RESERVED 2u
 #define KNX_MEMORY_ACPI 3u
-#define KNX_BOOT_BIOS 1u
 #define KNX_BOOT_UEFI 2u
 
 typedef struct {
@@ -98,8 +98,8 @@ void knx_shell_run(knx_boot_info *info);
 void knx_cpu_init(void);
 void knx_cpu_info(void);
 void knx_cpu_topology(void);
-void knx_gdt_init(void);
-void knx_gdt_init_cpu(unsigned cpu);
+void knx_percpu_init(void);
+void knx_percpu_init_cpu(unsigned cpu);
 void knx_set_kernel_stack(uint64_t stack_top);
 
 uint64_t knx_kernel_stack_top(void);
@@ -107,6 +107,8 @@ void knx_vm_init(void);
 void *knx_vm_clone_user(void);
 void knx_vm_destroy_user(void *root);
 void knx_vm_switch(void *root);
+uint64_t knx_vm_current_root(void);
+int knx_vm_user_readable(uint64_t address, uint64_t length);
 int64_t knx_vm_map_anonymous(uint64_t size, uint64_t permissions);
 void knx_net_tick(void);
 
@@ -127,7 +129,7 @@ int64_t knx_vm_map_user_page(uint64_t address, uint64_t permissions);
 
 void *knx_vm_load_elf(const void *image, uint64_t size, uint64_t *end_out, uint64_t *entry_out,
                      uint64_t stack_va, uint64_t stack_frame);
-void knx_idt_init(void);
+void knx_exceptions_init(void);
 void knx_interrupts_init(void);
 void knx_smp_init(knx_boot_info *info);
 uint64_t knx_smp_cpu_count(void);
@@ -161,12 +163,6 @@ void knx_net_ping(uint32_t target);
 void knx_net_ifconfig(void);
 void knx_net_netstat(void);
 
-uint8_t knx_io_in8(uint16_t port);
-uint16_t knx_io_in16(uint16_t port);
-uint32_t knx_io_in32(uint16_t port);
-void knx_io_out8(uint16_t port, uint8_t value);
-void knx_io_out16(uint16_t port, uint16_t value);
-void knx_io_out32(uint16_t port, uint32_t value);
 typedef void (*knx_irq_handler_fn)(unsigned vector, uint64_t *frame);
 
 int knx_irq_register(unsigned vector, knx_irq_handler_fn handler);
@@ -219,6 +215,7 @@ typedef int (*knx_driver_probe_fn)(const knx_pci_device *device);
 
 int knx_driver_register(const char *name, uint8_t class_code, uint8_t subclass, uint8_t prog_if,
                         knx_driver_probe_fn probe);
+int knx_driver_match(const knx_pci_device *device, const char **name_out);
 uint32_t knx_pci_read32(const knx_pci_device *device, unsigned offset);
 void knx_pci_write32(const knx_pci_device *device, unsigned offset, uint32_t value);
 
@@ -229,23 +226,12 @@ int knx_pci_enable_device(const knx_pci_device *device, uint16_t flags);
 
 uint64_t knx_pci_mmio_bar(const knx_pci_device *device, unsigned index);
 int knx_xhci_probe(const knx_pci_device *device);
-int knx_i2c_lpss_probe(const knx_pci_device *device);
 void knx_i2c_tick(void);
 void knx_warm_reboot(void);
 
-int knx_uhci_probe(const knx_pci_device *device);
-int knx_ohci_probe(const knx_pci_device *device);
-int knx_ehci_probe(const knx_pci_device *device);
-char knx_legacy_usbkbd_read(void);
-void knx_legacy_usb_tick(void);
-int knx_rtl8139_probe(const knx_pci_device *device);
+
 int knx_e1000_probe(const knx_pci_device *device);
-int knx_es1370_probe(const knx_pci_device *device);
-int knx_hda_probe(const knx_pci_device *device);
 void knx_audio_tick(void);
-void knx_pcspk_init(void);
-void knx_pcspk_beep(uint32_t hz, uint32_t ms);
-void knx_pcspk_tick(void);
 void knx_usb_tick(void);
 char knx_usbkbd_read(void);
 int knx_pcm_write(const uint8_t *buf, uint64_t len);
@@ -276,8 +262,10 @@ void knx_start_user_tasks(void);
 
 int knx_kernel_exec(const char *path, const char *const argv[], const char *const envp[]);
 uint64_t *knx_interrupt_dispatch(uint64_t vector, uint64_t error, uint64_t *frame);
+uint64_t *knx_schedule(uint64_t *frame);
+void knx_arch_secondary_init(uint64_t cpu_index);
 int knx_syscall(uint64_t *frame);
-void knx_ap_main(uint64_t apic_id);
+void knx_ap_main(uint64_t cpu_index);
 uint64_t knx_task_count(void);
 uint64_t knx_task_syscalls(void);
 

@@ -64,21 +64,21 @@ struct knx_key_event {
 
 static inline __attribute__((always_inline)) int64_t knx_syscall2(uint64_t number, uint64_t arg0,
                                                                   uint64_t arg1) {
-    register uint64_t rax __asm__("rax") = number;
-    register uint64_t rdi __asm__("rdi") = arg0;
-    register uint64_t rsi __asm__("rsi") = arg1;
-    __asm__ volatile("int $0x80" : "+a"(rax) : "D"(rdi), "S"(rsi) : "memory", "cc");
-    return (int64_t)rax;
+    register uint64_t x8 __asm__("x8") = number;
+    register uint64_t x0 __asm__("x0") = arg0;
+    register uint64_t x1 __asm__("x1") = arg1;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1) : "memory");
+    return (int64_t)x0;
 }
 
 static inline __attribute__((always_inline)) int64_t knx_syscall3(uint64_t number, uint64_t arg0,
                                                                   uint64_t arg1, uint64_t arg2) {
-    register uint64_t rax __asm__("rax") = number;
-    register uint64_t rdi __asm__("rdi") = arg0;
-    register uint64_t rsi __asm__("rsi") = arg1;
-    register uint64_t rdx __asm__("rdx") = arg2;
-    __asm__ volatile("int $0x80" : "+a"(rax) : "D"(rdi), "S"(rsi), "d"(rdx) : "memory", "cc");
-    return (int64_t)rax;
+    register uint64_t x8 __asm__("x8") = number;
+    register uint64_t x0 __asm__("x0") = arg0;
+    register uint64_t x1 __asm__("x1") = arg1;
+    register uint64_t x2 __asm__("x2") = arg2;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return (int64_t)x0;
 }
 
 static inline __attribute__((always_inline)) int64_t knx_sys_waitpid(int64_t pid,
@@ -115,7 +115,7 @@ static inline __attribute__((always_inline)) int64_t knx_sys_fork(void) {
 static inline __attribute__((always_inline, noreturn)) void knx_sys_exit(int status) {
     (void)knx_syscall2(KNX_SYS_EXIT, (uint64_t)(int64_t)status, 0);
     for (;;)
-        __asm__ volatile("pause");
+        __asm__ volatile("yield");
 }
 
 static inline __attribute__((always_inline)) int64_t knx_sys_thread_create(void (*entry)(void)) {
@@ -176,30 +176,30 @@ static inline __attribute__((always_inline)) int64_t knx_sys_console_gfx(uint64_
 static inline __attribute__((always_inline)) int64_t knx_sys_execve(const char *path,
                                                                     const char *const argv[],
                                                                     const char *const envp[]) {
-    register uint64_t rax __asm__("rax") = KNX_SYS_EXECVE;
-    register uint64_t rdi __asm__("rdi") = (uint64_t)(uintptr_t)path;
-    register uint64_t rsi __asm__("rsi") = (uint64_t)(uintptr_t)argv;
-    register uint64_t rdx __asm__("rdx") = (uint64_t)(uintptr_t)envp;
-    __asm__ volatile("int $0x80" : "+a"(rax) : "D"(rdi), "S"(rsi), "d"(rdx) : "memory", "cc");
-    return (int64_t)rax;
+    register uint64_t x8 __asm__("x8") = KNX_SYS_EXECVE;
+    register uint64_t x0 __asm__("x0") = (uint64_t)(uintptr_t)path;
+    register uint64_t x1 __asm__("x1") = (uint64_t)(uintptr_t)argv;
+    register uint64_t x2 __asm__("x2") = (uint64_t)(uintptr_t)envp;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return (int64_t)x0;
 }
 
 static inline __attribute__((always_inline)) int64_t knx_syscall6(uint64_t number, uint64_t arg0,
                                                                   uint64_t arg1, uint64_t arg2,
                                                                   uint64_t arg3, uint64_t arg4,
                                                                   uint64_t arg5) {
-    register uint64_t rax __asm__("rax") = number;
-    register uint64_t rdi __asm__("rdi") = arg0;
-    register uint64_t rsi __asm__("rsi") = arg1;
-    register uint64_t rdx __asm__("rdx") = arg2;
-    register uint64_t rcx __asm__("rcx") = arg3;
-    register uint64_t r8 __asm__("r8") = arg4;
-    register uint64_t r9 __asm__("r9") = arg5;
-    __asm__ volatile("int $0x80"
-                     : "+a"(rax)
-                     : "D"(rdi), "S"(rsi), "d"(rdx), "c"(rcx), "r"(r8), "r"(r9)
-                     : "memory", "cc");
-    return (int64_t)rax;
+    register uint64_t x8 __asm__("x8") = number;
+    register uint64_t x0 __asm__("x0") = arg0;
+    register uint64_t x1 __asm__("x1") = arg1;
+    register uint64_t x2 __asm__("x2") = arg2;
+    register uint64_t x3 __asm__("x3") = arg3;
+    register uint64_t x4 __asm__("x4") = arg4;
+    register uint64_t x5 __asm__("x5") = arg5;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                     : "memory");
+    return (int64_t)x0;
 }
 
 static inline __attribute__((always_inline)) int64_t knx_sys_socket(int domain, int type, int protocol) {
@@ -245,14 +245,16 @@ static inline __attribute__((always_inline)) int64_t knx_sys_ping(uint32_t targe
 }
 
 static inline __attribute__((always_inline)) uint64_t knx_sys_bootflags(void) {
-    register uint64_t rax __asm__("rax") = KNX_SYS_BOOTFLAGS;
-    __asm__ volatile("int $0x80" : "+a"(rax) : : "memory", "cc");
-    return rax;
+    register uint64_t x8 __asm__("x8") = KNX_SYS_BOOTFLAGS;
+    register uint64_t x0 __asm__("x0") = 0;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
 }
 
 static inline __attribute__((always_inline)) void knx_sys_reboot(void) {
-    register uint64_t rax __asm__("rax") = KNX_SYS_REBOOT;
-    __asm__ volatile("int $0x80" : "+a"(rax) : : "memory", "cc");
+    register uint64_t x8 __asm__("x8") = KNX_SYS_REBOOT;
+    register uint64_t x0 __asm__("x0") = 0;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
 }
 
 static inline __attribute__((always_inline)) int64_t

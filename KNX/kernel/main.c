@@ -3,7 +3,7 @@
 static void boot_halt(const char *message) {
     knx_log("[ERROR]", message);
     for (;;)
-        __asm__ volatile("cli; hlt");
+        knx_halt();
 }
 
 void kernel_main(knx_boot_info *info) {
@@ -12,7 +12,7 @@ void kernel_main(knx_boot_info *info) {
 #ifndef KNX_QUIET_LOGS
     knx_puts("Copyright (c) The KonfigX Team\n");
 #endif
-    knx_log("[BOOT]", "UEFI/BIOS handoff to kernel");
+    knx_log("[BOOT]", "UEFI handoff to kernel");
     if (!info || info->magic != KNX_BOOT_MAGIC || info->version != KNX_BOOT_VERSION ||
         !info->memory_map || !info->memory_region_count)
         boot_halt("Invalid or incomplete bootloader information");
@@ -22,7 +22,8 @@ void kernel_main(knx_boot_info *info) {
     knx_puts("\n");
 
     knx_log("[CORE]", "Installing CPU tables and bootstrap memory...");
-    knx_gdt_init();
+    /* Install the per-CPU kernel stack layer. */
+    knx_percpu_init();
 
     knx_vm_init();
 
@@ -41,8 +42,6 @@ void kernel_main(knx_boot_info *info) {
     knx_log("[CONSOLE]", "Initializing kernel console...");
     knx_console_init(info);
 
-    knx_pcspk_init();
-    knx_pcspk_beep(880, 120);
     knx_fb_set_info(info);
     knx_log("[CONSOLE]", "Console initialized");
 
@@ -54,7 +53,7 @@ void kernel_main(knx_boot_info *info) {
         knx_log("[TEST]", "heap allocator FAIL");
 
     knx_log("[INT]", "Installing Interrupt Descriptor Table...");
-    knx_idt_init();
+    knx_exceptions_init();
 
     knx_log("[VFS]", "Initializing virtual filesystem...");
     knx_vfs_init();
@@ -111,9 +110,7 @@ void kernel_main(knx_boot_info *info) {
     else
         knx_log("[TEST]", "stage4 login FAIL");
     knx_log("[TUI]", "Starting text console and kernel shell");
-    knx_puts("Ready (");
-    knx_puts(info->boot_method == KNX_BOOT_UEFI ? "UEFI" : "BIOS");
-    knx_puts("). Type help for commands.\n");
+    knx_puts("Ready (UEFI). Type help for commands.\n");
 #ifndef KNX_QUIET_LOGS
     knx_log("[BOOT]", "Starting kernel main loop...");
 #endif

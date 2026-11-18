@@ -11,12 +11,6 @@ typedef struct knx_ext_api {
     void (*kprintf)(const char *message);
     void *(*kmalloc)(uint64_t size);
     void (*kfree)(void *pointer);
-    uint8_t (*in8)(uint16_t port);
-    uint16_t (*in16)(uint16_t port);
-    uint32_t (*in32)(uint16_t port);
-    void (*out8)(uint16_t port, uint8_t value);
-    void (*out16)(uint16_t port, uint16_t value);
-    void (*out32)(uint16_t port, uint32_t value);
     uint32_t (*pci_read)(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
     int (*irq_register)(unsigned vector, void (*handler)(unsigned, uint64_t *));
 } knx_ext_api_t;

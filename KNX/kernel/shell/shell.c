@@ -1,35 +1,30 @@
 #include "knx.h"
 #include "knx_syscall.h"
 
-static inline uint8_t inb(uint16_t p) {
-    uint8_t v;
-    __asm__ volatile("inb %1,%0" : "=a"(v) : "Nd"(p));
-    return v;
-}
-static inline void outb(uint16_t p, uint8_t v) {
-    __asm__ volatile("outb %0,%1" ::"a"(v), "Nd"(p));
-}
+/*
+ * AArch64 shell.  Input arrives through the event rings owned by interrupts.c,
+ * time comes from the architectural counter, and reboots go through PSCI.
+ */
 
-static inline void wait_for_interrupt(void) {
-    __asm__ volatile("sti; hlt");
-}
+static void wait_for_interrupt(void) { knx_halt(); }
 
 static char read_char(void) {
     for (;;) {
-
         if (knx_console_owned()) {
             wait_for_interrupt();
             continue;
         }
+        uint64_t flags = knx_irq_flags_save();
         char c = knx_serial_read_char();
-        if (c)
-            return c;
-        c = knx_keyboard_read();
+        if (!c)
+            c = knx_keyboard_read();
+        knx_irq_flags_restore(flags);
         if (c)
             return c;
         wait_for_interrupt();
     }
 }
+
 static int equal(const char *a, const char *b) {
     while (*a && *a == *b) {
         ++a;
@@ -37,10 +32,12 @@ static int equal(const char *a, const char *b) {
     }
     return *a == *b;
 }
+
 static void line(const char *s) {
     knx_puts(s);
     knx_puts("\n");
 }
+
 static void show_memory(knx_boot_info *info) {
     knx_puts("Total usable memory: ");
     knx_print_u64(knx_total_memory() / 1048576);
@@ -50,6 +47,7 @@ static void show_memory(knx_boot_info *info) {
     knx_print_u64(info ? info->memory_region_count : 0);
     knx_puts("\n");
 }
+
 static int parse_uint(const char **p, uint64_t *out) {
     while (**p == ' ')
         ++*p;
@@ -65,6 +63,7 @@ static int parse_uint(const char **p, uint64_t *out) {
     *out = n;
     return 1;
 }
+
 static void calc(const char *s) {
     uint64_t a, b, r;
     if (!parse_uint(&s, &a)) {
@@ -119,60 +118,20 @@ static void calc(const char *s) {
     knx_print_u64(r);
     knx_puts("\n");
 }
-static uint8_t rtc(uint8_t reg) {
-    outb(0x70, reg);
-    return inb(0x71);
-}
-static uint8_t bcd(uint8_t v) {
-    return (uint8_t)((v & 15) + ((v >> 4) * 10));
-}
+
+/* Report uptime from the architectural counter. */
 static void show_date(void) {
-    while (rtc(0x0a) & 0x80) {
-    }
-    uint8_t sec = rtc(0), min = rtc(2), hour = rtc(4), day = rtc(7), month = rtc(8), year = rtc(9),
-            status = rtc(0x0b);
-    if (!(status & 4)) {
-        sec = bcd(sec);
-        min = bcd(min);
-        day = bcd(day);
-        month = bcd(month);
-        year = bcd(year);
-        hour = (uint8_t)((hour & 0x80) | bcd(hour & 0x7f));
-    }
-    if (!(status & 2)) {
-        uint8_t pm = hour & 0x80;
-        hour &= 0x7f;
-        if (pm)
-            hour = (uint8_t)((hour + 12) % 24);
-        else if (hour == 12)
-            hour = 0;
-    }
-    knx_puts("20");
-    if (year < 10)
-        knx_putc('0');
-    knx_print_u64(year);
-    knx_putc('-');
-    if (month < 10)
-        knx_putc('0');
-    knx_print_u64(month);
-    knx_putc('-');
-    if (day < 10)
-        knx_putc('0');
-    knx_print_u64(day);
-    knx_putc(' ');
-    if (hour < 10)
-        knx_putc('0');
-    knx_print_u64(hour);
-    knx_putc(':');
-    if (min < 10)
-        knx_putc('0');
-    knx_print_u64(min);
-    knx_putc(':');
-    if (sec < 10)
-        knx_putc('0');
-    knx_print_u64(sec);
-    knx_puts("\n");
+    uint64_t hz = knx_tsc_hz();
+    uint64_t secs = hz ? knx_read_tsc() / hz : 0;
+    knx_puts("System uptime: ");
+    knx_print_u64(secs / 3600);
+    knx_puts("h ");
+    knx_print_u64((secs / 60) % 60);
+    knx_puts("m ");
+    knx_print_u64(secs % 60);
+    knx_puts("s (architectural timer)\n");
 }
+
 static void show_uptime(void) {
     uint64_t secs = knx_ticks() / 100;
     knx_print_u64(secs / 3600);
@@ -182,6 +141,7 @@ static void show_uptime(void) {
     knx_print_u64(secs % 60);
     knx_puts("s\n");
 }
+
 static void build_kfs_path(const char *name, char *path, unsigned size) {
     (void)size;
     char rel[128];
@@ -224,7 +184,6 @@ static void build_kfs_path(const char *name, char *path, unsigned size) {
 }
 
 static void cmd_ls(const char *arg) {
-
     char mount_buf[128];
     const char *mount = "/";
     if (arg) {
@@ -396,8 +355,8 @@ static void execute(char *linebuf, knx_boot_info *info) {
     else if (equal(linebuf, "about")) {
         knx_puts("KNX OS 1.0-alpha\n");
         knx_puts("Kernel: " KNX_KERNEL_VERSION "\n");
-        knx_puts("Original x86_64 OS built with C, C++, Rust, and x86_64 assembly.\n");
-        knx_puts("Assembly driver support: port I/O routines and interrupt entry stubs.\n");
+        knx_puts("AArch64 kernel built with C, C++, and Rust.\n");
+        knx_puts("Drivers use MMIO; exceptions are handled by the AArch64 vector table.\n");
     }
     else if (equal(linebuf, "clear"))
         knx_clear();
@@ -453,19 +412,8 @@ static void execute(char *linebuf, knx_boot_info *info) {
         knx_puts("\n");
     } else if (equal(linebuf, "calc"))
         calc(args);
-    else if (equal(linebuf, "beep")) {
-        uint64_t hz = 880, ms = 150;
-        const char *p = args;
-        uint64_t value;
-        if (parse_uint(&p, &value) && value && value <= 20000)
-            hz = value;
-        while (*p == ' ')
-            ++p;
-        if (parse_uint(&p, &value) && value <= 10000)
-            ms = value;
-        knx_pcspk_beep((uint32_t)hz, (uint32_t)ms);
-        line("beep");
-    }
+    else if (equal(linebuf, "beep"))
+        line("beep: PC speaker is not available on AArch64.");
     else if (equal(linebuf, "rust")) {
         uint64_t r = knx_rust_add(40, 2);
         knx_puts("Rust module: 40 + 2 = ");
@@ -475,9 +423,7 @@ static void execute(char *linebuf, knx_boot_info *info) {
         if (!knx_cpp_command(linebuf))
             line("C++ demo returned no result.");
     } else if (equal(linebuf, "sysinfo")) {
-        knx_puts(KNX_KERNEL_VERSION " | ");
-        knx_puts(info && info->boot_method == KNX_BOOT_UEFI ? "UEFI" : "BIOS");
-        knx_puts(" | ");
+        knx_puts(KNX_KERNEL_VERSION " | UEFI | ");
         knx_cpu_info();
         show_memory(info);
     } else if (equal(linebuf, "devices"))
@@ -500,25 +446,21 @@ static void execute(char *linebuf, knx_boot_info *info) {
             knx_net_ping(ip);
     }
     else if (equal(linebuf, "reboot")) {
-        line("Requesting ACPI system reboot...");
-        if (!knx_acpi_reboot())
-            line("ACPI reset unavailable; trying the keyboard controller.");
-        __asm__ volatile("cli");
-        for (unsigned i = 0; i < 1000000 && (inb(0x64) & 2); ++i) {
-        }
-        outb(0x64, 0xfe);
+        line("Requesting PSCI system reboot...");
+        knx_warm_reboot();
+        line("PSCI reset unavailable; halting.");
         for (;;)
-            __asm__ volatile("hlt");
+            knx_halt();
     } else if (equal(linebuf, "poweroff")) {
-        line("Requesting ACPI system power off...");
-        if (!knx_acpi_poweroff())
-            line("ACPI power off unavailable. It is now safe to power down the system.");
+        line("Requesting PSCI system power off...");
+        if (knx_acpi_poweroff())
+            line("PSCI power off failed. It is now safe to power down the system.");
         for (;;)
-            __asm__ volatile("cli; hlt");
+            knx_halt();
     } else if (equal(linebuf, "halt")) {
         line("System halted. It is now safe to power down the system.");
         for (;;)
-            __asm__ volatile("cli; hlt");
+            knx_halt();
     } else if (*linebuf) {
         knx_puts("Unknown command: ");
         knx_puts(linebuf);
@@ -533,18 +475,16 @@ void knx_shell_run(knx_boot_info *info) {
     if (!buffer) {
         line("KNX shell: unable to allocate command buffer.");
         for (;;)
-            __asm__ volatile("hlt");
+            knx_halt();
     }
     uint64_t console_deadline = knx_ticks() + USER_CONSOLE_GRACE_TICKS;
     int user_console_seen = 0;
     for (;;) {
         if (knx_console_owned()) {
-
             user_console_seen = 1;
             wait_for_interrupt();
             continue;
         }
-
         if (!user_console_seen &&
             (int64_t)(knx_ticks() - console_deadline) < 0) {
             wait_for_interrupt();

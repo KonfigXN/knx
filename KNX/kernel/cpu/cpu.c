@@ -1,101 +1,111 @@
 #include "knx.h"
-static char vendor[13] = "Unknown";
-static char brand[49] = "Unknown x86_64 CPU";
-static uint32_t feature_ecx, feature_edx, ext_edx;
-static uint32_t logical_per_package = 1, cores_per_package = 1, threads_per_core = 1;
-static uint32_t cpuid_logical_count = 1, cpuid_bsp_id;
 
-static void cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *a, uint32_t *b, uint32_t *c,
-                  uint32_t *d) {
-    __asm__ volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(subleaf));
+/*
+ * AArch64 CPU identification.  CPUID is gone; everything comes from the
+ * system registers MIDR_EL1, MPIDR_EL1, ID_AA64PFR0_EL1 and ID_AA64ISAR0_EL1.
+ */
+
+static char vendor[16] = "Unknown";
+static char brand[64] = "Unknown AArch64 CPU";
+static char features[128] = "";
+static uint64_t midr_value;
+static uint64_t mpidr_value;
+static uint64_t pfr0_value;
+static uint64_t isar0_value;
+
+static void append_hex(char *dst, unsigned *pos, unsigned capacity, uint64_t value,
+                       unsigned digits) {
+    static const char hex[] = "0123456789abcdef";
+    for (unsigned i = 0; i < digits && *pos + 1u < capacity; ++i) {
+        unsigned shift = (digits - 1u - i) * 4u;
+        dst[(*pos)++] = hex[(value >> shift) & 0xfu];
+    }
+    dst[*pos] = '\0';
+}
+
+static void append_str(char *dst, unsigned *pos, unsigned capacity, const char *text) {
+    while (*text && *pos + 1u < capacity)
+        dst[(*pos)++] = *text++;
+    dst[*pos] = '\0';
 }
 
 void knx_cpu_init(void) {
-    uint32_t a, b, c, d;
-    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0), "c"(0));
-    *(uint32_t *)&vendor[0] = b;
-    *(uint32_t *)&vendor[4] = d;
-    *(uint32_t *)&vendor[8] = c;
-    vendor[12] = 0;
-    uint32_t max = a;
-    if (max >= 1) {
-        cpuid(1, 0, &a, &b, &feature_ecx, &feature_edx);
-        cpuid_logical_count = (b >> 16) & 255;
-        if (!cpuid_logical_count)
-            cpuid_logical_count = 1;
-        cpuid_bsp_id = b >> 24;
-    }
+    __asm__ volatile("mrs %0, midr_el1" : "=r"(midr_value));
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr_value));
+    __asm__ volatile("mrs %0, id_aa64pfr0_el1" : "=r"(pfr0_value));
+    __asm__ volatile("mrs %0, id_aa64isar0_el1" : "=r"(isar0_value));
 
-    uint32_t topology_leaf = max >= 0x1f ? 0x1f : (max >= 0x0b ? 0x0b : 0);
-    if (topology_leaf) {
-        uint32_t smt_count = 0, package_count = 0;
-        for (uint32_t level = 0; level < 8; ++level) {
-            cpuid(topology_leaf, level, &a, &b, &c, &d);
-            uint32_t kind = (c >> 8) & 255;
-            if (!b || !kind)
-                break;
-            if (kind == 1)
-                smt_count = b;
-            if (kind == 2)
-                package_count = b;
-        }
-        if (package_count) {
-            logical_per_package = package_count;
-            threads_per_core = smt_count ? smt_count : 1;
-            cores_per_package = package_count / threads_per_core;
-            if (!cores_per_package)
-                cores_per_package = 1;
-        }
-    } else if (max >= 4) {
-        cpuid(4, 0, &a, &b, &c, &d);
-        if ((a & 31) != 0)
-            cores_per_package = ((a >> 26) & 63) + 1;
-        threads_per_core = cpuid_logical_count / cores_per_package;
-        if (!threads_per_core)
-            threads_per_core = 1;
-        logical_per_package = cpuid_logical_count;
+    unsigned implementer = (unsigned)((midr_value >> 24) & 0xffu);
+    unsigned variant = (unsigned)((midr_value >> 20) & 0xfu);
+    unsigned architecture = (unsigned)((midr_value >> 16) & 0xfu);
+    unsigned partnum = (unsigned)((midr_value >> 4) & 0xfffu);
+    unsigned revision = (unsigned)(midr_value & 0xfu);
+
+    const char *vendor_name;
+    switch (implementer) {
+    case 0x41u: vendor_name = "ARM"; break;
+    case 0x43u: vendor_name = "Cavium"; break;
+    case 0x4du: vendor_name = "Freescale"; break;
+    case 0x50u: vendor_name = "Qualcomm"; break;
+    case 0x51u: vendor_name = "Qualcomm"; break;
+    case 0x69u: vendor_name = "Intel"; break;
+    case 0x7fu: vendor_name = "NVIDIA"; break;
+    default:    vendor_name = "Unknown"; break;
     }
-    cpuid(0x80000000, 0, &a, &b, &c, &d);
-    uint32_t max_extended = a;
-    if (max_extended >= 0x80000004) {
-        uint32_t *p = (uint32_t *)brand;
-        for (uint32_t leaf = 0; leaf < 3; ++leaf) {
-            a = 0x80000002 + leaf;
-            __asm__ volatile("cpuid"
-                             : "=a"(p[0]), "=b"(p[1]), "=c"(p[2]), "=d"(p[3])
-                             : "a"(a), "c"(0));
-            p += 4;
-        }
-        brand[48] = 0;
-    }
-    if (max_extended >= 0x80000001)
-        cpuid(0x80000001, 0, &a, &b, &c, &ext_edx);
+    unsigned pos = 0;
+    append_str(vendor, &pos, sizeof(vendor), vendor_name);
+
+    pos = 0;
+    append_str(brand, &pos, sizeof(brand), "implementer 0x");
+    append_hex(brand, &pos, sizeof(brand), implementer, 2);
+    append_str(brand, &pos, sizeof(brand), " part 0x");
+    append_hex(brand, &pos, sizeof(brand), partnum, 3);
+    append_str(brand, &pos, sizeof(brand), " var 0x");
+    append_hex(brand, &pos, sizeof(brand), variant, 1);
+    append_str(brand, &pos, sizeof(brand), " arch 0x");
+    append_hex(brand, &pos, sizeof(brand), architecture, 1);
+    append_str(brand, &pos, sizeof(brand), " rev 0x");
+    append_hex(brand, &pos, sizeof(brand), revision, 1);
+
+    pos = 0;
+    if (((pfr0_value >> 20) & 0xfu) == 0u)
+        append_str(features, &pos, sizeof(features), "FP ");
+    if (((pfr0_value >> 16) & 0xfu) == 0u)
+        append_str(features, &pos, sizeof(features), "SIMD ");
+    if (((pfr0_value >> 4) & 0xfu) >= 3u)
+        append_str(features, &pos, sizeof(features), "GICv3 ");
+    if (((isar0_value >> 4) & 0xfu) != 0u)
+        append_str(features, &pos, sizeof(features), "AES ");
+    if (((isar0_value >> 16) & 0xfu) != 0u)
+        append_str(features, &pos, sizeof(features), "CRC32 ");
+    if (((isar0_value >> 20) & 0xfu) != 0u)
+        append_str(features, &pos, sizeof(features), "LSE ");
+    if (!pos)
+        append_str(features, &pos, sizeof(features), "none");
 }
+
 void knx_cpu_info(void) {
     knx_puts("CPU vendor: ");
     knx_puts(vendor);
     knx_puts("\nCPU model: ");
     knx_puts(brand);
+    knx_puts("\nMIDR: 0x");
+    knx_print_u64(midr_value);
     knx_puts("\nFeatures: ");
-    knx_puts((ext_edx & (1u << 29)) ? "x86_64 " : "x86_64-unsupported ");
-    knx_puts((feature_edx & (1u << 4)) ? "TSC " : "");
-    knx_puts((feature_edx & (1u << 26)) ? "SSE2 " : "");
-    knx_puts((feature_ecx & (1u << 25)) ? "AES " : "");
-    knx_puts((feature_ecx & (1u << 21)) ? "x2APIC " : "");
-    knx_puts((feature_ecx & (1u << 28)) ? "AVX " : "");
+    knx_puts(features);
     knx_puts("\n");
 }
 
 void knx_cpu_topology(void) {
-    knx_puts("CPUID topology: ");
-    knx_print_u64(logical_per_package);
-    knx_puts(" logical/package, ");
-    knx_print_u64(cores_per_package);
-    knx_puts(" cores/package, ");
-    knx_print_u64(threads_per_core);
-    knx_puts(" threads/core; CPUID logical count: ");
-    knx_print_u64(cpuid_logical_count);
-    knx_puts("; CPUID BSP APIC ID: ");
-    knx_print_u64(cpuid_bsp_id);
-    knx_puts("\n");
+    knx_puts("MPIDR: 0x");
+    knx_print_u64(mpidr_value);
+    knx_puts("\nAffinity: ");
+    knx_print_u64((mpidr_value >> 32) & 0xffu);
+    knx_puts(".");
+    knx_print_u64((mpidr_value >> 16) & 0xffu);
+    knx_puts(".");
+    knx_print_u64((mpidr_value >> 8) & 0xffu);
+    knx_puts(".");
+    knx_print_u64(mpidr_value & 0xffu);
+    knx_puts(" (Aff3.Aff2.Aff1.Aff0)\n");
 }

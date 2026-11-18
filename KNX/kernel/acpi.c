@@ -1,5 +1,12 @@
 #include "knx.h"
 
+/*
+ * ACPI table discovery is retained (the boot loader hands us the RSDP and the
+ * tables can be walked directly).  Power control, however, no longer uses GAS
+ * I/O-port accesses: AArch64 systems are reset/powered off through PSCI, which
+ * the firmware already implements (QEMU virt uses PSCI via HVC).
+ */
+
 struct __attribute__((packed)) acpi_header {
     char signature[4];
     uint32_t length;
@@ -7,16 +14,8 @@ struct __attribute__((packed)) acpi_header {
     uint8_t oem[6], table_id[8];
     uint32_t oem_revision, creator_id, creator_revision;
 };
-struct gas {
-    uint8_t space, width, offset, access_size;
-    uint64_t address;
-};
 
 static volatile struct acpi_header *fadt;
-static uint32_t pm1a_port, pm1b_port, smi_command;
-static uint8_t acpi_enable_value, pm1_control_length;
-static struct gas pm1a_gas, pm1b_gas, reset_gas;
-static uint8_t reset_value;
 static uint8_t sleep_type_a, sleep_type_b;
 static int have_sleep_type;
 
@@ -152,16 +151,6 @@ static int parse_s5(volatile struct acpi_header *dsdt) {
     return 0;
 }
 
-static struct gas load_gas(const volatile uint8_t *p) {
-    struct gas g;
-    g.space = p[0];
-    g.width = p[1];
-    g.offset = p[2];
-    g.access_size = p[3];
-    g.address = read64(p + 4);
-    return g;
-}
-
 void knx_acpi_init(knx_boot_info *info) {
     volatile uint8_t *rsdp = find_rsdp(info);
     if (!rsdp)
@@ -180,20 +169,10 @@ void knx_acpi_init(knx_boot_info *info) {
     fadt = find_table(root, xsdt, "FACP");
     if (!fadt || fadt->length < 90)
         return;
+
+    /* The sleep control fields are parsed for informational purposes only;
+     * poweroff/reboot are handled by PSCI below. */
     volatile uint8_t *p = (volatile uint8_t *)fadt;
-    pm1a_port = read32(p + 64);
-    pm1b_port = read32(p + 68);
-    smi_command = read32(p + 48);
-    acpi_enable_value = p[52];
-    pm1_control_length = p[89];
-    if (fadt->length >= 196) {
-        pm1a_gas = load_gas(p + 172);
-        pm1b_gas = load_gas(p + 184);
-    }
-    if (fadt->length >= 129) {
-        reset_gas = load_gas(p + 116);
-        reset_value = p[128];
-    }
     uint64_t dsdt_address = read32(p + 40);
     if (fadt->length >= 148 && read64(p + 140))
         dsdt_address = read64(p + 140);
@@ -206,69 +185,35 @@ void knx_acpi_init(knx_boot_info *info) {
 void knx_acpi_info(void) {
     knx_puts("ACPI: ");
     knx_puts(fadt ? "FADT available" : "power-management tables unavailable");
-    knx_puts(have_sleep_type ? "; S5 poweroff available\n" : "; S5 poweroff unavailable\n");
+    if (have_sleep_type) {
+        knx_puts("; S5 poweroff type A=");
+        knx_print_u64(sleep_type_a);
+        knx_puts(" B=");
+        knx_print_u64(sleep_type_b);
+        knx_puts("\n");
+    } else {
+        knx_puts("; S5 poweroff unavailable\n");
+    }
+    knx_puts("Power control: PSCI (hvc #0, SYSTEM_OFF/SYSTEM_RESET)\n");
 }
 
-static int gas_write(const struct gas *g, uint8_t value) {
-    if (!g->address)
-        return 0;
-    if (g->space == 1 && g->address <= 0xffff) {
-        __asm__ volatile("outb %0,%1" : : "a"(value), "Nd"((uint16_t)g->address));
-        return 1;
-    }
-    if (g->space == 0) {
-        *(volatile uint8_t *)(uintptr_t)g->address = value;
-        return 1;
-    }
-    return 0;
+/* PSCI 32-bit calls: x0 = function id, result in x0 (0 = success).  The
+ * SYSTEM_OFF and SYSTEM_RESET calls do not return when the firmware accepts
+ * them; a returned value is therefore a failure status. */
+static inline uint64_t psci_call(uint64_t fid) {
+    register uint64_t x0 __asm__("x0") = fid;
+    __asm__ volatile("hvc #0" : "+r"(x0) : : "memory");
+    return x0;
 }
 
-static int gas_write16(const struct gas *g, uint16_t value) {
-    if (!g->address)
-        return 0;
-    if (g->space == 1 && g->address <= 0xfffe) {
-        __asm__ volatile("outw %0,%1" : : "a"(value), "Nd"((uint16_t)g->address));
-        return 1;
-    }
-    if (g->space == 0) {
-        *(volatile uint16_t *)(uintptr_t)g->address = value;
-        return 1;
-    }
-    return 0;
-}
+#define PSCI_SYSTEM_OFF  0x84000008ULL
+#define PSCI_SYSTEM_RESET 0x84000009ULL
 
+/* Return nonzero when the firmware rejected the request. */
 int knx_acpi_reboot(void) {
-    return gas_write(&reset_gas, reset_value);
+    return psci_call(PSCI_SYSTEM_RESET) != 0;
 }
 
 int knx_acpi_poweroff(void) {
-    if (!fadt || !have_sleep_type || pm1_control_length < 2)
-        return 0;
-    if (smi_command && acpi_enable_value && pm1a_port && pm1a_port <= 0xffff) {
-        uint16_t control;
-        __asm__ volatile("inw %1,%0" : "=a"(control) : "Nd"((uint16_t)pm1a_port));
-        if (!(control & 1)) {
-            __asm__ volatile("outb %0,%1" : : "a"(acpi_enable_value), "Nd"((uint16_t)smi_command));
-            for (unsigned i = 0; i < 1000000; ++i) {
-                __asm__ volatile("inw %1,%0" : "=a"(control) : "Nd"((uint16_t)pm1a_port));
-                if (control & 1)
-                    break;
-                __asm__ volatile("pause");
-            }
-        }
-    }
-    uint16_t value_a = (uint16_t)((sleep_type_a << 10) | (1u << 13));
-    uint16_t value_b = (uint16_t)((sleep_type_b << 10) | (1u << 13));
-    int wrote = 0;
-    if (pm1a_gas.address)
-        wrote |= gas_write16(&pm1a_gas, value_a);
-    else if (pm1a_port && pm1a_port <= 0xffff) {
-        __asm__ volatile("outw %0,%1" : : "a"(value_a), "Nd"((uint16_t)pm1a_port));
-        wrote = 1;
-    }
-    if (pm1b_gas.address)
-        wrote |= gas_write16(&pm1b_gas, value_b);
-    else if (pm1b_port && pm1b_port <= 0xffff)
-        __asm__ volatile("outw %0,%1" : : "a"(value_b), "Nd"((uint16_t)pm1b_port));
-    return wrote;
+    return psci_call(PSCI_SYSTEM_OFF) != 0;
 }

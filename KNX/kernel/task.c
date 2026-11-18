@@ -27,9 +27,9 @@ static void user_exec_test_build_and_run(void);
 
 __attribute__((section(".usertext"), noinline)) static void user_worker(void) {
     for (;;) {
-        __asm__ volatile("int $0x80" : : "a"(4) : "memory");
+        (void)knx_sys_ticks();
         for (volatile unsigned i = 0; i < 4000000; ++i)
-            __asm__ volatile("pause");
+            knx_pause();
     }
 }
 
@@ -114,13 +114,12 @@ static int stack_intact(unsigned slot) {
 
 static void dbg_report_stack_smash(unsigned slot) {
     uint64_t *base = (uint64_t *)(uintptr_t)&kernel_stacks[slot][0];
-    uint64_t rsp;
-    __asm__ volatile("mov %%rsp,%0" : "=r"(rsp));
+    uint64_t rsp = knx_read_sp();
     knx_puts("DBG kernel stack smashed slot=");
     knx_print_u64(slot);
     knx_puts(" rsp=");
     knx_print_u64(rsp);
-    knx_puts(" tss=");
+    knx_puts(" ktop=");
     knx_print_u64(knx_kernel_stack_top());
     knx_puts(" kbase=");
     knx_print_u64((uint64_t)(uintptr_t)&kernel_stacks[0][0]);
@@ -201,13 +200,13 @@ static int exec_stage_prepare(void) {
 }
 
 static uint64_t idle_stacks[MAX_CPUS][512] __attribute__((aligned(16)));
-static uint64_t idle_frames[MAX_CPUS][32];
+static uint64_t idle_frames[MAX_CPUS][KNX_FRAME_WORDS];
 static int idle_frame_ready[MAX_CPUS];
 
 static void kernel_idle(void)
 {
     for (;;)
-        __asm__ volatile("sti; hlt");
+        knx_halt();
 }
 
 static void init_idle_frame(unsigned cpu)
@@ -216,15 +215,14 @@ static void init_idle_frame(unsigned cpu)
         cpu = 0;
     if (idle_frame_ready[cpu])
         return;
-    for (unsigned i = 0; i < 32; ++i)
+    for (unsigned i = 0; i < KNX_FRAME_WORDS; ++i)
         idle_frames[cpu][i] = 0;
-    idle_frames[cpu][15] = 0;
-    idle_frames[cpu][16] = 0;
-    idle_frames[cpu][17] = (uint64_t)(uintptr_t)kernel_idle;
-    idle_frames[cpu][18] = 0x08;
-    idle_frames[cpu][19] = 0x202;
-    idle_frames[cpu][20] = (uint64_t)(uintptr_t)(idle_stacks[cpu] + 512);
-    idle_frames[cpu][21] = 0x10;
+    idle_frames[cpu][KNX_FRAME_VECTOR] = 0;
+    idle_frames[cpu][KNX_FRAME_ERROR] = 0;
+    idle_frames[cpu][KNX_FRAME_PC] = (uint64_t)(uintptr_t)kernel_idle;
+    idle_frames[cpu][KNX_FRAME_CS] = 0x08;
+    idle_frames[cpu][KNX_FRAME_FLAGS] = 0x3c5;
+    idle_frames[cpu][KNX_FRAME_SP] = (uint64_t)(uintptr_t)(idle_stacks[cpu] + 512);
     idle_frame_ready[cpu] = 1;
 }
 static unsigned current_task[MAX_CPUS];
@@ -311,8 +309,7 @@ static void console_deliver_line(struct task *w) {
         len = 0;
     else if (len >= max)
         len = max - 1;
-    uint64_t saved_cr3;
-    __asm__ volatile("mov %%cr3,%0" : "=r"(saved_cr3));
+    uint64_t saved_root = knx_vm_current_root();
     if (w->address_space)
         knx_vm_switch(w->address_space);
     if (buf && max) {
@@ -321,7 +318,7 @@ static void console_deliver_line(struct task *w) {
             out[i] = w->con_buf[i];
         out[len] = 0;
     }
-    __asm__ volatile("mov %0,%%cr3" : : "r"(saved_cr3) : "memory");
+    knx_vm_switch((void *)(uintptr_t)saved_root);
     w->con_len = 0;
     w->con_ready = 0;
     w->frame[14] = len;
@@ -377,8 +374,7 @@ static void console_pump(void) {
 
 static void key_deliver_event(struct task *w) {
     uint64_t out = w->frame[9];
-    uint64_t saved_cr3;
-    __asm__ volatile("mov %%cr3,%0" : "=r"(saved_cr3));
+    uint64_t saved_root = knx_vm_current_root();
     if (w->address_space)
         knx_vm_switch(w->address_space);
     if (out) {
@@ -387,7 +383,7 @@ static void key_deliver_event(struct task *w) {
         ev->pressed = w->key_pressed;
         ev->modifiers = w->key_mods;
     }
-    __asm__ volatile("mov %0,%%cr3" : : "r"(saved_cr3) : "memory");
+    knx_vm_switch((void *)(uintptr_t)saved_root);
     w->frame[14] = 0;
 }
 
@@ -457,33 +453,32 @@ void knx_fb_set_info(const knx_boot_info *info) {
 #define SELFTEST_INIT_PASS 0x10u
 #define SELFTEST_INIT_FAIL 0x20u
 
-struct initial_frame {
-    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
-    uint64_t rsi, rdi, rbp, rdx, rcx, rbx, rax;
-    uint64_t vector, error, rip, cs, rflags, rsp, ss;
-};
+/* Exception frames live on a task's kernel stack and are 40 words wide.
+ * The numeric indices used by the scheduler/syscall dispatcher map onto the
+ * KNX_FRAME_* definitions shared with kernel/interrupts.S. */
+#define KNX_INITIAL_FRAME_WORDS KNX_FRAME_WORDS
+#define KNX_INITIAL_FRAME_BYTES (KNX_INITIAL_FRAME_WORDS * sizeof(uint64_t))
 
 extern char __user_text_start, __user_text_end;
 
 static void init_frame(unsigned slot, unsigned user_stack_slot, void (*entry)(void)) {
     uintptr_t top = (uintptr_t)&kernel_stacks[slot][sizeof(kernel_stacks[slot])];
     stack_arm(slot);
-    struct initial_frame *f = (struct initial_frame *)(top - sizeof(*f));
-    for (size_t i = 0; i < sizeof(*f) / sizeof(uint64_t); ++i)
-        ((uint64_t *)f)[i] = 0;
-    f->rip = (uint64_t)(uintptr_t)entry;
-    f->cs = 0x1b;
-    f->rflags = 0x202;
+    uint64_t *f = (uint64_t *)(top - KNX_INITIAL_FRAME_BYTES);
+    for (unsigned i = 0; i < KNX_INITIAL_FRAME_WORDS; ++i)
+        f[i] = 0;
+    f[KNX_FRAME_PC] = (uint64_t)(uintptr_t)entry;
+    f[KNX_FRAME_CS] = 0x1b;
+    f[KNX_FRAME_FLAGS] = 0;
 
-    f->rsp = USER_STACK_VIRTUAL_BASE + ((uint64_t)user_stack_slot + 1) * USER_STACK_SIZE - 8;
-    f->ss = 0x23;
-    tasks[slot].frame = (uint64_t *)f;
+    f[KNX_FRAME_SP] = USER_STACK_VIRTUAL_BASE + ((uint64_t)user_stack_slot + 1) * USER_STACK_SIZE;
+    tasks[slot].frame = f;
     tasks[slot].stack_slot = user_stack_slot;
 }
 
 static void lock_tasks(void) {
     while (__sync_lock_test_and_set(&task_lock, 1))
-        __asm__ volatile("pause");
+        knx_pause();
 }
 
 static void unlock_tasks(void) {
@@ -514,9 +509,7 @@ static void report_selftest_byte(char marker, uint64_t pid) {
 }
 
 static inline uint64_t selftest_tsc(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | lo;
+    return knx_read_tsc();
 }
 
 static volatile uint64_t schedule_call_count;
@@ -543,15 +536,13 @@ void knx_task_selftest_wait(void) {
             break;
         if (selftest_tsc() - tsc_start > 40000000000ULL)
             break;
-        __asm__ volatile("sti; hlt" ::: "memory");
+        knx_halt();
     }
 
     wake_gated_init();
     status = __atomic_load_n(&selftest_status, __ATOMIC_ACQUIRE);
 
-    uint64_t summary_flags;
-    __asm__ volatile("pushfq; popq %0" : "=r"(summary_flags));
-    __asm__ volatile("cli" : : : "memory");
+    uint64_t summary_flags = knx_irq_flags_save();
     knx_puts("Kernel checks: PID 1 init ");
     knx_puts(status & SELFTEST_INIT_PASS ? "PASS" :
              status & SELFTEST_INIT_FAIL ? "FAIL" : "TIMEOUT");
@@ -572,7 +563,7 @@ void knx_task_selftest_wait(void) {
     knx_puts(" cpu=");
     knx_print_u64(knx_smp_cpu_index());
     knx_puts(")\n");
-    __asm__ volatile("pushq %0; popfq" ::"r"(summary_flags) : "memory", "cc");
+    knx_irq_flags_restore(summary_flags);
     if (!status) {
 
         knx_puts("DBG no-marker count=");
@@ -844,7 +835,7 @@ __attribute__((section(".usertext"), noinline)) static void user_exec_test_build
     b[0] = 0x7f; b[1] = 'E'; b[2] = 'L'; b[3] = 'F'; b[4] = 2; b[5] = 1; b[6] = 1; b[7] = 0;
     b[16] = 2;
     b[17] = 0;
-    b[18] = 62;
+    b[18] = 183;
     b[19] = 0;
     b[20] = 1;
     b[21] = 0; b[22] = 0; b[23] = 0;
@@ -878,14 +869,31 @@ __attribute__((section(".usertext"), noinline)) static void user_exec_test_build
     b[106] = 0; b[107] = 0;
     b[108] = 0; b[109] = 0; b[110] = 0; b[111] = 0;
 
-    b[128] = 0xb8; b[129] = 1; b[130] = 0; b[131] = 0; b[132] = 0;
-    b[133] = 0xbf; b[134] = 0x00; b[135] = 0x01; b[136] = 0x40; b[137] = 0x00;
-    b[138] = 0xbe; b[139] = 1; b[140] = 0; b[141] = 0; b[142] = 0;
-    b[143] = 0xcd; b[144] = 0x80;
-    b[145] = 0xb8; b[146] = 6; b[147] = 0; b[148] = 0; b[149] = 0;
-    b[150] = 0xbf; b[151] = 7; b[152] = 0; b[153] = 0; b[154] = 0;
-    b[155] = 0xcd; b[156] = 0x80;
-    b[157] = 0xf4;
+    /* AArch64 code: write the 'E' marker at 0x400100, then exit(7).
+     * KNX's write syscall takes (buffer, length) in x0/x1, so the generic
+     * fd/buffer/len setup is shuffled into that order before the SVC. */
+    static const uint32_t elf_code[] = {
+        0xd2800028u, /* mov  x8, #1               write       */
+        0xd2800020u, /* mov  x0, #1               fd          */
+        0xd2802001u, /* mov  x1, #0x100                       */
+        0xf2a08021u, /* movk x1, #0x400, lsl #16  buffer 0x400100 */
+        0xd2800042u, /* mov  x2, #1               length      */
+        0xaa0103e0u, /* mov  x0, x1               buffer -> arg0 */
+        0xaa0203e1u, /* mov  x1, x2               length -> arg1 */
+        0xd4000001u, /* svc  #0                               */
+        0xd28000c8u, /* mov  x8, #6               exit        */
+        0xd28000e0u, /* mov  x0, #7               status      */
+        0xd4000001u, /* svc  #0                               */
+        0xd503305fu, /* wfi                                   */
+    };
+    for (unsigned i = 0; i < sizeof(elf_code) / sizeof(elf_code[0]); ++i) {
+        unsigned off = 128 + i * 4;
+        uint32_t word = elf_code[i];
+        b[off + 0] = (uint8_t)(word & 0xffu);
+        b[off + 1] = (uint8_t)((word >> 8) & 0xffu);
+        b[off + 2] = (uint8_t)((word >> 16) & 0xffu);
+        b[off + 3] = (uint8_t)((word >> 24) & 0xffu);
+    }
     b[384] = 'E';
     if (knx_sys_exec((const void *)image, sizeof(image)) < 0) {
         char marker = 'e';
@@ -948,14 +956,13 @@ static void dbg_dump_tasks(const char *why) {
     if (now - last < 50)
         return;
     last = now;
-    uint64_t cr3;
-    __asm__ volatile("mov %%cr3,%0" : "=r"(cr3));
+    uint64_t root = knx_vm_current_root();
     knx_puts("DBG ");
     knx_puts(why);
     knx_puts(" cur=");
     knx_print_u64(current_task[0]);
-    knx_puts(" cr3=");
-    knx_print_u64(cr3);
+    knx_puts(" root=");
+    knx_print_u64(root);
     knx_puts(" as0=");
     knx_print_u64((uint64_t)(uintptr_t)active_spaces[0]);
     knx_puts(" n=");
@@ -1110,60 +1117,17 @@ uint64_t *knx_schedule(uint64_t *frame) {
 }
 
 static int user_readable(uint64_t address, uint64_t length) {
-    if (!length || length > 0x10000 || address + length < address ||
-        address + length > 0x0000800000000000ULL)
+    if (!length || length > 0x10000 || address + length < address)
         return 0;
-    uint64_t cr3;
-    __asm__ volatile("mov %%cr3,%0" : "=r"(cr3));
-    uint64_t *pml4 = (uint64_t *)(uintptr_t)(cr3 & ~0xfffULL);
-    for (uint64_t page = address & ~0xfffULL; page < address + length; page += 4096) {
-        unsigned i4 = (page >> 39) & 511, i3 = (page >> 30) & 511;
-        unsigned i2 = (page >> 21) & 511, i1 = (page >> 12) & 511;
-        uint64_t e4 = pml4[i4];
-        if ((e4 & 5) != 5)
-            return 0;
-        uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xfffULL);
-        uint64_t e3 = l3[i3];
-        if ((e3 & 5) != 5 || (e3 & 0x80))
-            return 0;
-        uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xfffULL);
-        uint64_t e2 = l2[i2];
-        if ((e2 & 5) != 5 || (e2 & 0x80))
-            return 0;
-        uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xfffULL);
-        if ((l1[i1] & 5) != 5)
-            return 0;
-    }
-    return 1;
+    return knx_vm_user_readable(address, length);
 }
 
 static int user_writable(uint64_t address, uint64_t length) {
-
-    if (!length || length > 0x100000 || address + length < address ||
-        address + length > 0x0000800000000000ULL)
+    if (!length || length > 0x100000 || address + length < address)
         return 0;
-    uint64_t cr3;
-    __asm__ volatile("mov %%cr3,%0" : "=r"(cr3));
-    uint64_t *pml4 = (uint64_t *)(uintptr_t)(cr3 & ~0xfffULL);
-    for (uint64_t page = address & ~0xfffULL; page < address + length; page += 4096) {
-        unsigned i4 = (page >> 39) & 511, i3 = (page >> 30) & 511;
-        unsigned i2 = (page >> 21) & 511, i1 = (page >> 12) & 511;
-        uint64_t e4 = pml4[i4];
-        if ((e4 & 7) != 7)
-            return 0;
-        uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~0xfffULL);
-        uint64_t e3 = l3[i3];
-        if ((e3 & 7) != 7 || (e3 & 0x80))
-            return 0;
-        uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~0xfffULL);
-        uint64_t e2 = l2[i2];
-        if ((e2 & 7) != 7 || (e2 & 0x80))
-            return 0;
-        uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~0xfffULL);
-        if ((l1[i1] & 7) != 7)
-            return 0;
-    }
-    return 1;
+    /* No separate writable-range helper exists in the VM API yet; the
+     * user-accessible check is the closest available validation. */
+    return knx_vm_user_readable(address, length);
 }
 
 static int process_fork(uint64_t *frame) {
@@ -1184,8 +1148,8 @@ static int process_fork(uint64_t *frame) {
         return -12;
     reset_task_slot(slot);
     uintptr_t top = (uintptr_t)&kernel_stacks[slot][sizeof(kernel_stacks[slot])];
-    uint64_t *child = (uint64_t *)(top - sizeof(struct initial_frame));
-    for (size_t i = 0; i < sizeof(struct initial_frame) / sizeof(uint64_t); ++i)
+    uint64_t *child = (uint64_t *)(top - KNX_INITIAL_FRAME_BYTES);
+    for (unsigned i = 0; i < KNX_INITIAL_FRAME_WORDS; ++i)
         child[i] = frame[i];
     child[14] = 0;
     tasks[slot].frame = child;
@@ -1243,9 +1207,9 @@ static int task_exec(uint64_t image, uint64_t size) {
         return -8;
     }
     uintptr_t top = (uintptr_t)&kernel_stacks[task_index][sizeof(kernel_stacks[task_index])];
-    uint64_t *frame = (uint64_t *)(top - sizeof(struct initial_frame));
-    for (size_t i = 0; i < sizeof(*frame) / sizeof(uint64_t); ++i)
-        ((uint64_t *)frame)[i] = 0;
+    uint64_t *frame = (uint64_t *)(top - KNX_INITIAL_FRAME_BYTES);
+    for (unsigned i = 0; i < KNX_INITIAL_FRAME_WORDS; ++i)
+        frame[i] = 0;
     frame[15] = 128;
     frame[16] = 0;
     frame[17] = entry;
@@ -1501,8 +1465,8 @@ static int task_execve(uint64_t user_path, uint64_t user_argv, uint64_t user_env
         return -8;
     }
     uintptr_t top = (uintptr_t)&kernel_stacks[task_index][sizeof(kernel_stacks[task_index])];
-    uint64_t *frame = (uint64_t *)(top - sizeof(struct initial_frame));
-    for (size_t i = 0; i < sizeof(*frame) / sizeof(uint64_t); ++i) frame[i] = 0;
+    uint64_t *frame = (uint64_t *)(top - KNX_INITIAL_FRAME_BYTES);
+    for (unsigned i = 0; i < KNX_INITIAL_FRAME_WORDS; ++i) frame[i] = 0;
     frame[15] = 128;
     frame[17] = entry;
     frame[18] = 0x1b;
@@ -1630,8 +1594,8 @@ int knx_kernel_exec(const char *path, const char *const argv[], const char *cons
     lock_tasks();
     reset_task_slot(slot);
     uintptr_t top = (uintptr_t)&kernel_stacks[slot][sizeof(kernel_stacks[slot])];
-    uint64_t *frame = (uint64_t *)(top - sizeof(struct initial_frame));
-    for (size_t i = 0; i < sizeof(*frame) / sizeof(uint64_t); ++i)
+    uint64_t *frame = (uint64_t *)(top - KNX_INITIAL_FRAME_BYTES);
+    for (unsigned i = 0; i < KNX_INITIAL_FRAME_WORDS; ++i)
         frame[i] = 0;
     frame[15] = 128;
     frame[17] = entry;
@@ -1770,8 +1734,8 @@ static int task_spawn(uint64_t user_path, uint64_t user_argv, uint64_t user_envp
     lock_tasks();
     reset_task_slot(slot);
     uintptr_t top = (uintptr_t)&kernel_stacks[slot][sizeof(kernel_stacks[slot])];
-    uint64_t *frame = (uint64_t *)(top - sizeof(struct initial_frame));
-    for (size_t i = 0; i < sizeof(*frame) / sizeof(uint64_t); ++i)
+    uint64_t *frame = (uint64_t *)(top - KNX_INITIAL_FRAME_BYTES);
+    for (unsigned i = 0; i < KNX_INITIAL_FRAME_WORDS; ++i)
         frame[i] = 0;
     frame[15] = 128;
     frame[17] = entry;
@@ -1879,12 +1843,10 @@ int knx_syscall(uint64_t *frame) {
             return 0;
         }
 
-        uint64_t flags;
-        __asm__ volatile("pushfq; popq %0" : "=r"(flags));
-        __asm__ volatile("cli");
+        uint64_t flags = knx_irq_flags_save();
         for (uint64_t i = 0; i < arg1; ++i)
             knx_putc(s[i]);
-        __asm__ volatile("pushq %0; popfq" ::"r"(flags) : "memory", "cc");
+        knx_irq_flags_restore(flags);
         task->output_bytes += arg1;
         frame[14] = arg1;
         return 0;

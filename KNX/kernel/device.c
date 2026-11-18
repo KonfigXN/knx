@@ -1,47 +1,41 @@
 #include "knx.h"
 
-#define MAX_DRIVERS 16
 #define MAX_DEVICES 64
 
-struct driver_entry {
-    const char *name;
-    uint8_t class_code, subclass, prog_if;
-    knx_driver_probe_fn probe;
-};
+/* QEMU "virt" maps the PCIe enhanced configuration access mechanism here. */
+#define KNX_PCI_ECAM_BASE 0x4010000000ULL
+
 struct device_entry {
     knx_pci_device pci;
     const char *driver;
 };
-static struct driver_entry drivers[MAX_DRIVERS];
 static struct device_entry devices[MAX_DEVICES];
-static unsigned driver_count, device_count, matched_count;
+static unsigned device_count, matched_count;
 static int builtin_drivers_registered;
 
-static int same_text(const char *a, const char *b) {
-    while (*a && *a == *b) {
-        ++a;
-        ++b;
-    }
-    return *a == *b;
+/* Implemented in driver.c (the PCI driver registry owns its own entry type). */
+extern int knx_driver_match(const knx_pci_device *pci, const char **name_out);
+
+static volatile uint32_t *ecam_reg(unsigned bus, unsigned slot, unsigned function,
+                                   unsigned offset) {
+    uint64_t address = KNX_PCI_ECAM_BASE |
+                       ((uint64_t)bus << 20) | ((uint64_t)slot << 15) |
+                       ((uint64_t)function << 12) | ((uint64_t)(offset & 0xfffu));
+    return (volatile uint32_t *)(uintptr_t)address;
 }
 
-static void outl(uint16_t port, uint32_t value) {
-    knx_io_out32(port, value);
-}
-static uint32_t inl(uint16_t port) {
-    return knx_io_in32(port);
-}
 static uint32_t pci_config_read(unsigned bus, unsigned slot, unsigned function, unsigned offset) {
-    uint32_t address = 0x80000000u | (bus << 16) | (slot << 11) | (function << 8) | (offset & 0xfc);
-    outl(0xcf8, address);
-    return inl(0xcfc);
+    uint32_t value = *ecam_reg(bus, slot, function, offset);
+    knx_dmb();
+    return value;
 }
+
 static void pci_config_write(unsigned bus, unsigned slot, unsigned function, unsigned offset,
                              uint32_t value) {
-    uint32_t address = 0x80000000u | (bus << 16) | (slot << 11) | (function << 8) | (offset & 0xfc);
-    outl(0xcf8, address);
-    outl(0xcfc, value);
+    *ecam_reg(bus, slot, function, offset) = value;
+    knx_dmb();
 }
+
 uint32_t knx_pci_read32(const knx_pci_device *device, unsigned offset) {
     if (!device || offset >= 256)
         return 0xffffffffu;
@@ -51,16 +45,12 @@ uint32_t knx_pci_read32(const knx_pci_device *device, unsigned offset) {
 void knx_pci_write32(const knx_pci_device *device, unsigned offset, uint32_t value) {
     if (!device || offset >= 256)
         return;
-    uint32_t address = 0x80000000u | ((uint32_t)device->bus << 16) |
-                       ((uint32_t)device->device << 11) | ((uint32_t)device->function << 8) |
-                       (offset & 0xfcu);
-    outl(0xcf8, address);
-    outl(0xcfc, value);
+    pci_config_write(device->bus, device->device, device->function, offset, value);
 }
 
 int knx_pci_enable_device(const knx_pci_device *device, uint16_t flags) {
     if (!device || (flags & ~(KNX_PCI_ENABLE_IO | KNX_PCI_ENABLE_MEMORY |
-                              KNX_PCI_ENABLE_BUS_MASTER)))
+                               KNX_PCI_ENABLE_BUS_MASTER)))
         return -1;
     uint32_t id = knx_pci_read32(device, 0);
     if ((uint16_t)id == 0xffff || (uint16_t)(id >> 16) == 0xffff)
@@ -92,17 +82,6 @@ uint64_t knx_pci_mmio_bar(const knx_pci_device *device, unsigned index) {
     return base;
 }
 
-int knx_driver_register(const char *name, uint8_t class_code, uint8_t subclass, uint8_t prog_if,
-                        knx_driver_probe_fn probe) {
-    if (!name || !probe || driver_count >= MAX_DRIVERS)
-        return -1;
-    for (unsigned i = 0; i < driver_count; ++i)
-        if (same_text(drivers[i].name, name))
-            return -1;
-    drivers[driver_count++] = (struct driver_entry){name, class_code, subclass, prog_if, probe};
-    return 0;
-}
-
 static void inspect_function(unsigned bus, unsigned slot, unsigned function) {
     uint32_t id = pci_config_read(bus, slot, function, 0);
     uint16_t vendor = (uint16_t)id;
@@ -110,7 +89,6 @@ static void inspect_function(unsigned bus, unsigned slot, unsigned function) {
         return;
     uint32_t header = pci_config_read(bus, slot, function, 0x0c);
     if ((uint8_t)(header >> 16) == 1) {
-
         uint32_t command = pci_config_read(bus, slot, function, 4);
         pci_config_write(bus, slot, function, 4,
                          command | KNX_PCI_ENABLE_MEMORY | KNX_PCI_ENABLE_BUS_MASTER);
@@ -134,16 +112,8 @@ static void inspect_function(unsigned bus, unsigned slot, unsigned function) {
     pci.interrupt_pin = (uint8_t)(interrupt >> 8);
 
     const char *bound = "unbound";
-    for (unsigned i = 0; i < driver_count; ++i) {
-        struct driver_entry *d = &drivers[i];
-        if ((d->class_code == 0xff || d->class_code == pci.class_code) &&
-            (d->subclass == 0xff || d->subclass == pci.subclass) &&
-            (d->prog_if == 0xff || d->prog_if == pci.prog_if) && d->probe(&pci)) {
-            bound = d->name;
-            ++matched_count;
-            break;
-        }
-    }
+    if (knx_driver_match(&pci, &bound))
+        ++matched_count;
     if (device_count < MAX_DEVICES)
         devices[device_count++] = (struct device_entry){pci, bound};
 }
@@ -156,19 +126,10 @@ void knx_devices_init(void) {
         else
             knx_log("[DRIVER]", "Could not register the built-in xHCI driver");
 
-        knx_driver_register("EHCI USB 2.0 (companion handoff)", 0x0c, 0x03, 0x02,
-                            knx_ehci_probe);
-
-        knx_driver_register("OHCI USB 1.1 host", 0x0c, 0x03, 0xff, knx_ohci_probe);
-        knx_driver_register("UHCI USB 1.1 host", 0x0c, 0x03, 0x00, knx_uhci_probe);
-
-        knx_driver_register("Intel LPSS I2C", 0x0c, 0x80, 0x00, knx_i2c_lpss_probe);
-
-        knx_driver_register("RTL8139 Ethernet", 0x02, 0x00, 0xff, knx_rtl8139_probe);
-        knx_driver_register("Intel PRO/1000 Ethernet", 0x02, 0x00, 0xff, knx_e1000_probe);
-
-        knx_driver_register("ES1370 AC97 audio", 0x04, 0x01, 0xff, knx_es1370_probe);
-        knx_driver_register("HDA Azalia audio", 0x04, 0x03, 0x00, knx_hda_probe);
+        /* Legacy USB, ISA audio, Intel LPSS I2C and RTL8139 are not present
+         * on the target platform.  xHCI and e1000 are MMIO PCIe devices and
+         * remain supported. */
+        knx_driver_register("Intel PRO/1000 Ethernet (MMIO)", 0x02, 0x00, 0xff, knx_e1000_probe);
     }
     for (unsigned bus = 0; bus < 256; ++bus) {
         for (unsigned slot = 0; slot < 32; ++slot) {
@@ -211,7 +172,7 @@ void knx_devices_info(void) {
         knx_print_u64(e->pci.vendor_id);
         knx_putc(':');
         knx_print_u64(e->pci.device_id);
-        knx_puts(" BAR0=");
+        knx_puts(" BAR0=0x");
         knx_print_u64(e->pci.bar[0]);
         knx_puts(" IRQ=");
         if (e->pci.interrupt_pin) {

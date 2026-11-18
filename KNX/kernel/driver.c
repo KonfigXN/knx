@@ -1,50 +1,60 @@
 #include "knx.h"
 
-#define IRQ_HANDLERS_PER_VECTOR 4
-static knx_irq_handler_fn irq_handlers[16][IRQ_HANDLERS_PER_VECTOR];
-static volatile uint16_t enabled_irq_mask = 0xfffc;
+/*
+ * PCI driver registry.
+ *
+ * Interrupt handling (knx_irq_register/knx_irq_dispatch) belongs to the GIC
+ * layer in interrupts.c, along with the tick and input state, so this
+ * translation unit only owns the driver registry.
+ */
 
-int knx_irq_register(unsigned vector, knx_irq_handler_fn handler) {
-    if (vector < 32 || vector >= 48 || !handler)
-        return -1;
-    unsigned slot = vector - 32;
-    int inserted = 0;
-    for (unsigned i = 0; i < IRQ_HANDLERS_PER_VECTOR; ++i) {
-        knx_irq_handler_fn current = __atomic_load_n(&irq_handlers[slot][i], __ATOMIC_ACQUIRE);
-        if (current == handler)
-            return 0;
-        if (current)
-            continue;
-        knx_irq_handler_fn expected = 0;
-        if (__atomic_compare_exchange_n(&irq_handlers[slot][i], &expected, handler, 0,
-                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
-            inserted = 1;
-            break;
-        }
+#define MAX_DRIVERS 16
+
+typedef struct {
+    const char *name;
+    uint8_t class_code, subclass, prog_if;
+    knx_driver_probe_fn probe;
+} knx_driver_entry;
+
+static knx_driver_entry drivers[MAX_DRIVERS];
+static unsigned driver_count;
+
+static int same_text(const char *a, const char *b) {
+    while (*a && *a == *b) {
+        ++a;
+        ++b;
     }
-    if (!inserted)
+    return *a == *b;
+}
+
+int knx_driver_register(const char *name, uint8_t class_code, uint8_t subclass, uint8_t prog_if,
+                        knx_driver_probe_fn probe) {
+    if (!name || !probe || driver_count >= MAX_DRIVERS)
         return -1;
-    unsigned irq = vector - 32;
-    __atomic_fetch_and(&enabled_irq_mask, (uint16_t)~(1u << irq), __ATOMIC_RELEASE);
-    uint16_t mask_port = irq < 8 ? 0x21 : 0xa1;
-    unsigned bit = irq & 7;
-    knx_io_out8(mask_port, (uint8_t)(knx_io_in8(mask_port) & ~(1u << bit)));
-    if (irq >= 8)
-        knx_io_out8(0x21, (uint8_t)(knx_io_in8(0x21) & ~(1u << 2)));
+    for (unsigned i = 0; i < driver_count; ++i)
+        if (same_text(drivers[i].name, name))
+            return -1;
+    drivers[driver_count++] =
+        (knx_driver_entry){name, class_code, subclass, prog_if, probe};
     return 0;
 }
 
-uint16_t knx_irq_enabled_mask(void) {
-    return __atomic_load_n(&enabled_irq_mask, __ATOMIC_ACQUIRE);
-}
-
-void knx_irq_dispatch(unsigned vector, uint64_t *frame) {
-    if (vector < 32 || vector >= 48)
-        return;
-    for (unsigned i = 0; i < IRQ_HANDLERS_PER_VECTOR; ++i) {
-        knx_irq_handler_fn handler =
-            __atomic_load_n(&irq_handlers[vector - 32][i], __ATOMIC_ACQUIRE);
-        if (handler)
-            handler(vector, frame);
+/*
+ * Registry query used by the PCIe scanner in device.c.  Matching is done here
+ * so that the registry representation stays private to this file.
+ */
+int knx_driver_match(const knx_pci_device *pci, const char **name_out) {
+    if (!pci)
+        return 0;
+    for (unsigned i = 0; i < driver_count; ++i) {
+        const knx_driver_entry *d = &drivers[i];
+        if ((d->class_code == 0xff || d->class_code == pci->class_code) &&
+            (d->subclass == 0xff || d->subclass == pci->subclass) &&
+            (d->prog_if == 0xff || d->prog_if == pci->prog_if) && d->probe(pci)) {
+            if (name_out)
+                *name_out = d->name;
+            return 1;
+        }
     }
+    return 0;
 }

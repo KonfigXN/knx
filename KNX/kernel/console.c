@@ -1,6 +1,12 @@
 #include "knx.h"
-static volatile uint16_t *const vga = (uint16_t *)0xb8000;
-static unsigned vga_cursor;
+
+/*
+ * AArch64 console: there is no VGA text buffer at 0xb8000 and no COM1 port
+ * I/O.  Output goes to the UEFI/GOP framebuffer and to the flight-log ring;
+ * the serial helpers remain only for API compatibility (serial input is not
+ * available on this port).
+ */
+
 static unsigned col, row;
 static const uint8_t font[36][7] = {
     {14, 17, 17, 31, 17, 17, 17}, {30, 17, 17, 30, 17, 17, 30}, {14, 17, 16, 16, 16, 17, 14},
@@ -58,7 +64,6 @@ static void log_file_flush(void) {
     if (write((void *)(uintptr_t)log_file_handle, &bytes, log_buffer) || !bytes) {
         log_write_fn = 0;
     } else {
-
         efi_file_flush_fn flush = *(efi_file_flush_fn *)((uint8_t *)log_file_handle + 40 + 5 * 8);
         if (flush)
             (void)flush((void *)(uintptr_t)log_file_handle);
@@ -73,8 +78,11 @@ uint64_t knx_boot_flags(void) {
 static volatile struct knx_flight_header *const flight =
     (volatile struct knx_flight_header *)(uintptr_t)KNX_FLIGHT_PHYS;
 
+/* The flight log lives in normal memory shared with the UEFI loader.  A DMB
+ * is enough to make the ring-head update visible once a character is stored. */
 static inline void flight_flush(volatile void *p) {
-    __asm__ volatile("clflush %0" : : "m"(*(volatile uint8_t *)p) : "memory");
+    (void)p;
+    knx_dmb();
 }
 
 void knx_flight_init(void) {
@@ -85,6 +93,7 @@ void knx_flight_init(void) {
     flight_flush(&flight->len);
     flight_flush(&flight->wrapped);
 }
+
 void knx_flight_putc(char c) {
     if (flight->magic != KNX_FLIGHT_MAGIC)
         return;
@@ -142,44 +151,22 @@ static uint8_t glyph_row(unsigned char c, unsigned y) {
         return 0;
     return punctuation_font[20][y];
 }
-static inline void outb(uint16_t p, uint8_t v) {
-    __asm__ volatile("outb %0,%1" ::"a"(v), "Nd"(p));
-}
-static inline uint8_t inb(uint16_t p) {
-    uint8_t v;
-    __asm__ volatile("inb %1,%0" : "=a"(v) : "Nd"(p));
-    return v;
-}
 
-static void serial_char(char c) {
-    for (unsigned spin = 0; spin < 200000u; ++spin) {
-        if (inb(0x3fd) & 0x20) {
-            outb(0x3f8, (uint8_t)c);
-            return;
-        }
-        (void)inb(0x3fd);
-    }
-}
-
+/* No COM1/UART driver exists in this port.  The signature is retained because
+ * knx.h exports it; it always reports "no character available". */
 char knx_serial_read_raw(void) {
-    uint64_t flags;
-    __asm__ volatile("pushfq; popq %0" : "=r"(flags) : : "memory");
-    __asm__ volatile("cli" : : : "memory");
+    uint64_t flags = knx_irq_flags_save();
     char c = 0;
-    uint8_t lsr = inb(0x3fd);
-
-    if (lsr != 0xff && (lsr & 1))
-        c = (char)inb(0x3f8);
-    __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory", "cc");
+    knx_irq_flags_restore(flags);
     return c;
 }
+
 char knx_serial_read_char(void) {
     char c = knx_serial_read_raw();
     if (!c)
         return 0;
     if (c == '\r')
         return '\n';
-
     if ((uint8_t)c == 0x08 || (uint8_t)c == 0x7f)
         return '\b';
     return c;
@@ -256,10 +243,10 @@ static void draw_char(char c) {
             ++row;
     }
 }
+
 void knx_set_boot_info(knx_boot_info *info) {
     boot_flags = info ? info->boot_flags : 0;
     log_file_handle = 0;
-
     log_write_fn = 0;
     framebuffer_active = knx_graphics_init(info);
 
@@ -297,7 +284,6 @@ void knx_set_boot_info(knx_boot_info *info) {
             for (size_t i = 0; i < cells; ++i)
                 con_text[i] = 0;
         } else {
-
             con_cols = con_rows = 0;
             serial_only = 1;
         }
@@ -313,46 +299,34 @@ void knx_set_boot_info(knx_boot_info *info) {
         serial_only = 1;
     }
 }
-static void serial_init(void) {
-    outb(0x3f9, 0);
-    outb(0x3fb, 0x80);
-    outb(0x3f8, 3);
-    outb(0x3f9, 0);
-    outb(0x3fb, 3);
-    outb(0x3fa, 0xc7);
-    outb(0x3fc, 0x0b);
-}
+
 void knx_console_early_init(void) {
     serial_only = 1;
-    serial_init();
     knx_flight_init();
 }
+
 void knx_console_init(knx_boot_info *info) {
-    serial_init();
     knx_set_boot_info(info);
     serial_only = 0;
 }
 
 static void log_line(const char *category, const char *message) {
-    uint64_t flags;
-    __asm__ volatile("pushfq; popq %0" : "=r"(flags));
-    __asm__ volatile("cli" : : : "memory");
+    uint64_t flags = knx_irq_flags_save();
     knx_puts(category);
     knx_puts(" ");
     knx_puts(message);
     knx_puts("\n");
-    __asm__ volatile("pushq %0; popfq" ::"r"(flags) : "memory", "cc");
+    knx_irq_flags_restore(flags);
 }
+
 void knx_log(const char *category, const char *message) {
     if (!category || !message)
         return;
 #ifdef KNX_QUIET_LOGS
-
     if (boot_flags & KNX_BOOT_VERBOSE) {
         log_line(category, message);
         return;
     }
-
     int keep = (category[0]=='[' && category[1]=='E' && category[2]=='R' && category[3]=='R') ||
         (category[0]=='[' && category[1]=='W' && category[2]=='A' && category[3]=='R') ||
         (category[0]=='[' && category[1]=='R' && category[2]=='O' && category[3]=='O') ||
@@ -364,8 +338,8 @@ void knx_log(const char *category, const char *message) {
 #endif
     log_line(category, message);
 }
-void knx_putc(char c) {
 
+void knx_putc(char c) {
     if (log_write_fn && log_file_handle && log_len < sizeof(log_buffer) - 2) {
         if (c == '\n' && log_len && log_buffer[log_len - 1] != '\r')
             log_buffer[log_len++] = '\r';
@@ -379,41 +353,23 @@ void knx_putc(char c) {
         knx_capture_putc(slot, c);
         return;
     }
-    serial_char(c);
     if (framebuffer_active) {
         draw_char(c);
         return;
     }
     if (serial_only)
         return;
-
-    if (c == '\b') {
-        if (vga_cursor)
-            --vga_cursor;
-        return;
-    }
-    if (c == '\n') {
-        if (vga_cursor / 80 >= 24) {
-            for (unsigned y = 0; y < 24; ++y)
-                for (unsigned x = 0; x < 80; ++x)
-                    vga[y * 80 + x] = vga[(y + 1) * 80 + x];
-            for (unsigned x = 0; x < 80; ++x)
-                vga[24 * 80 + x] = 0x0f20;
-            vga_cursor = 24 * 80;
-        } else
-            vga_cursor = ((vga_cursor / 80) + 1) * 80;
-        return;
-    }
-    if (vga_cursor < 2000)
-        vga[vga_cursor++] = (uint16_t)(0x0f00 | (uint8_t)c);
 }
+
 void knx_puts(const char *s) {
     while (*s)
         knx_putc(*s++);
 }
+
 void knx_console_graphics_owner(void) {
     graphics_owner = 1;
 }
+
 void knx_clear(void) {
     if (framebuffer_active && !graphics_owner) {
         knx_gfx_fill_rect(0, 0, fb_width, fb_height, 0x101820);
@@ -422,15 +378,9 @@ void knx_clear(void) {
         if (con_text)
             for (size_t i = 0; i < (size_t)con_cols * con_rows; ++i)
                 con_text[i] = 0;
-        return;
     }
-    for (unsigned i = 0; i < 2000; ++i)
-        vga[i] = 0x0f20;
-    vga_cursor = 0;
-    static const char clear[] = {27, '[', '2', 'J', 27, '[', 'H', 0};
-    for (unsigned i = 0; clear[i]; ++i)
-        serial_char(clear[i]);
 }
+
 void knx_print_u64(uint64_t v) {
     char b[21];
     unsigned n = 0;
@@ -441,6 +391,7 @@ void knx_print_u64(uint64_t v) {
     while (n)
         knx_putc(b[--n]);
 }
+
 void knx_print_i64(int64_t v) {
     if (v < 0) {
         knx_putc('-');

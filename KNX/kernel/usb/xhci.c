@@ -20,7 +20,7 @@
 #define TRB_ISP (1u << 2)
 #define TRB_CH (1u << 4)
 #define TRB_IOC (1u << 5)
-#define TRB_IDT (1u << 6)
+#define TRB_INT_DATA_TOGGLE (1u << 6)
 #define TRB_BSR (1u << 9)
 #define TRB_DIR (1u << 16)
 #define TRB_TYPE_SHIFT 10
@@ -143,11 +143,7 @@ static void mmio_write64(volatile uint8_t *p, uint32_t offset, uint64_t value) {
     mmio_write32(p, offset + 4, (uint32_t)(value >> 32));
 }
 
-static uint64_t read_tsc(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | lo;
-}
+/* Time comes from the AArch64 architectural counter (cntvct_el0/cntfrq_el0). */
 
 static void *alloc_page(void) {
     uint8_t *page = (uint8_t *)knx_alloc_page();
@@ -177,7 +173,7 @@ static uint32_t ring_push(struct ring *ring, uint64_t param, uint32_t status,
         link->param = ring->phys;
         link->status = 0;
         link->control = TRB_TYPE(TR_LINK) | TRB_TC | ring->pcs;
-        __asm__ volatile("" ::: "memory");
+        knx_dmb();
         ring->pcs ^= 1;
         ring->enq = 0;
     }
@@ -185,9 +181,9 @@ static uint32_t ring_push(struct ring *ring, uint64_t param, uint32_t status,
     struct trb *trb = &ring->trbs[index];
     trb->param = param;
     trb->status = status;
-    __asm__ volatile("" ::: "memory");
+    knx_dmb();
     trb->control = control | ring->pcs;
-    __asm__ volatile("" ::: "memory");
+    knx_dmb();
     return index;
 }
 
@@ -197,7 +193,7 @@ static void ring_reset(struct ring *ring) {
         ring->trbs[i].status = 0;
         ring->trbs[i].control = 0;
     }
-    __asm__ volatile("" ::: "memory");
+    knx_dmb();
     ring->enq = 0;
     ring->pcs = 1;
 }
@@ -340,14 +336,14 @@ static void pump_events(struct xhci_controller *h) {
 }
 
 static int wait_cmd(struct xhci_controller *h) {
-    uint64_t deadline = read_tsc() + 2000000000ULL;
+    uint64_t deadline = knx_read_tsc() + 2ULL * knx_tsc_hz();
     while (!h->cmd_done) {
         pump_events(h);
         if (h->cmd_done)
             break;
-        if (read_tsc() > deadline)
+        if (knx_read_tsc() > deadline)
             return 0;
-        __asm__ volatile("pause");
+        knx_pause();
     }
     return h->cmd_code == CC_SUCCESS;
 }
@@ -435,7 +431,7 @@ static int control_transfer(struct xhci_controller *h, uint8_t request_type,
     h->xfer_done = 0;
     h->xfer_code = 0;
     ring_push(&h->ep0, param, 8,
-              TRB_TYPE(TR_SETUP) | TRB_IDT | TRB_CH | (trt << 16));
+              TRB_TYPE(TR_SETUP) | TRB_INT_DATA_TOGGLE | TRB_CH | (trt << 16));
     if (length)
         ring_push(&h->ep0, (uint64_t)(uintptr_t)buffer, length,
                   TRB_TYPE(TR_DATA) | TRB_CH | (in ? TRB_DIR : 0));
@@ -444,14 +440,14 @@ static int control_transfer(struct xhci_controller *h, uint8_t request_type,
     ring_push(&h->ep0, 0, 0, TRB_TYPE(TR_STATUS) | TRB_IOC | status_dir);
     doorbell(h, h->slot, 1);
 
-    uint64_t deadline = read_tsc() + 2000000000ULL;
+    uint64_t deadline = knx_read_tsc() + 2ULL * knx_tsc_hz();
     while (!h->xfer_done) {
         pump_events(h);
         if (h->xfer_done)
             break;
-        if (read_tsc() > deadline)
+        if (knx_read_tsc() > deadline)
             return 0;
-        __asm__ volatile("pause");
+        knx_pause();
     }
     return h->xfer_code == CC_SUCCESS;
 }
@@ -463,7 +459,7 @@ static int port_reset(struct xhci_controller *h, uint32_t reg) {
         sc = mmio32(h->base, reg);
     }
     mmio_write32(h->base, reg, XHCI_PORT_PP | XHCI_PORT_PR);
-    uint64_t deadline = read_tsc() + 2000000000ULL;
+    uint64_t deadline = knx_read_tsc() + 2ULL * knx_tsc_hz();
     for (;;) {
         sc = mmio32(h->base, reg);
         if (sc & XHCI_PORT_PED)
@@ -473,9 +469,9 @@ static int port_reset(struct xhci_controller *h, uint32_t reg) {
 
         if (sc & ((1u << 18) | (1u << 19) | (1u << 20)))
             return 0;
-        if (read_tsc() > deadline)
+        if (knx_read_tsc() > deadline)
             return 0;
-        __asm__ volatile("pause");
+        knx_pause();
     }
     mmio_write32(h->base, reg, XHCI_PORT_PP | XHCI_PORT_CLEAR);
     sc = mmio32(h->base, reg);
@@ -595,10 +591,7 @@ static void hid_kbd_report(struct hid_binding *b) {
     if (modifiers & 0x44)
         mods |= KNX_KEYMOD_ALT;
     knx_key_mods_set(mods);
-    if (!b->first_key_beep) {
-        b->first_key_beep = 1;
-        knx_pcspk_beep(600, 90);
-    }
+    b->first_key_beep = 1; /* No PC speaker on AArch64. */
 
     for (unsigned i = 2; i < 8; ++i) {
         uint8_t usage = b->prev_report[i];
@@ -707,7 +700,7 @@ static int enumerate_device(struct xhci_controller *h, unsigned port) {
     if (!octx)
         return 0;
     *(volatile uint64_t *)(h->dcbaap + 8 * h->slot) = (uint64_t)(uintptr_t)octx;
-    __asm__ volatile("" ::: "memory");
+    knx_dmb();
 
     h->ictx[0] = 0;
     h->ictx[1] = 0;
@@ -823,7 +816,6 @@ static int enumerate_device(struct xhci_controller *h, unsigned port) {
         bs[i]->ready = 1;
     }
 
-    knx_pcspk_beep(1200, 180);
     return nic;
 
 fail:
@@ -879,13 +871,13 @@ static int start_controller(struct xhci_controller *h) {
     knx_pci_enable_device(&pci, KNX_PCI_ENABLE_MEMORY | KNX_PCI_ENABLE_BUS_MASTER);
 
     mmio_write32(h->base, h->op, USBCMD_HCRST);
-    uint64_t deadline = read_tsc() + 2000000000ULL;
+    uint64_t deadline = knx_read_tsc() + 2ULL * knx_tsc_hz();
     while (mmio32(h->base, h->op) & USBCMD_HCRST) {
-        if (read_tsc() > deadline) {
+        if (knx_read_tsc() > deadline) {
             knx_log("[XHCI]", "Host controller reset timed out");
             return 0;
         }
-        __asm__ volatile("pause");
+        knx_pause();
     }
 
     mmio_write32(h->base, h->op + 0x38, h->max_slots);
@@ -908,19 +900,18 @@ static int start_controller(struct xhci_controller *h) {
     mmio_write32(h->base, h->rt + 0x20, 0);
 
     mmio_write32(h->base, h->op, USBCMD_RS);
-    deadline = read_tsc() + 2000000000ULL;
+    deadline = knx_read_tsc() + 2ULL * knx_tsc_hz();
     while (mmio32(h->base, h->op + 4) & USBSTS_HCH) {
-        if (read_tsc() > deadline) {
+        if (knx_read_tsc() > deadline) {
             knx_log("[XHCI]", "Host controller did not start");
             return 0;
         }
-        __asm__ volatile("pause");
+        knx_pause();
     }
 
     h->started = 1;
     h->halted = 0;
 
-    knx_pcspk_beep(1000, 150);
     knx_log("[XHCI]", "Host controller running");
     return 1;
 }
@@ -978,7 +969,7 @@ int knx_xhci_probe(const knx_pci_device *device) {
 }
 
 void knx_usb_tick(void) {
-    knx_legacy_usb_tick();
+    /* No legacy USB controllers on AArch64; xHCI MMIO is the only path. */
     for (unsigned c = 0; c < controller_count; ++c) {
         struct xhci_controller *h = &controllers[c];
         if (!h->started) {
@@ -1035,9 +1026,6 @@ void knx_usb_tick(void) {
 }
 
 char knx_usbkbd_read(void) {
-    char legacy = knx_legacy_usbkbd_read();
-    if (legacy)
-        return legacy;
     for (unsigned i = 0; i < MAX_BINDINGS; ++i) {
         struct hid_binding *b = &bindings[i];
         if (!b->in_use || !b->ready || b->protocol != 1)

@@ -1,15 +1,17 @@
+# AArch64-only toolchain configuration.
+#
+# Windows builds use the LLVM tools natively; POSIX builds use the system
+# cross compiler.  Both produce little-endian AArch64 ELF objects.
 ifeq ($(OS),Windows_NT)
 
-CC      = clang --target=x86_64-elf
-CXX     = clang++ --target=x86_64-elf
-AS32    = clang --target=i386-elf -c
-AS64    = clang --target=x86_64-elf -c
-LD32    = ld.lld -m elf_i386
-LD64    = ld.lld -m elf_x86_64
+CC      = clang --target=aarch64-elf
+CXX     = clang++ --target=aarch64-elf
+AS      = clang --target=aarch64-elf -c
+LD      = ld.lld -m aarch64elf
 OBJCOPY = llvm-objcopy
 RUSTC   = rustc
 
-RUST_TARGET = x86_64-unknown-none
+RUST_TARGET = aarch64-unknown-none
 RUST_SYSROOT_FLAG =
 ifneq ($(strip $(KNX_RUST_SYSROOT)),)
 RUST_SYSROOT_FLAG = --sysroot "$(KNX_RUST_SYSROOT)"
@@ -19,17 +21,19 @@ PLATFORM_STABLE_CFLAGS = -fno-unroll-loops -fno-vectorize -fno-slp-vectorize
 
 else
 
-CC      = gcc
-CXX     = g++
-AS32    = as --32
-AS64    = as --64
-LD32    = ld -m elf_i386
-LD64    = ld -m elf_x86_64
-OBJCOPY = objcopy
+CC      = aarch64-linux-gnu-gcc
+CXX     = aarch64-linux-gnu-g++
+AS      = aarch64-linux-gnu-as
+LD      = aarch64-linux-gnu-ld
+OBJCOPY = aarch64-linux-gnu-objcopy
 RUSTC   = rustc
 
-RUST_TARGET = x86_64-unknown-linux-gnu
+RUST_TARGET = aarch64-unknown-none
 RUST_SYSROOT_FLAG =
+ifneq ($(strip $(KNX_RUST_SYSROOT)),)
+RUST_SYSROOT_FLAG = --sysroot "$(KNX_RUST_SYSROOT)"
+endif
+
 PLATFORM_STABLE_CFLAGS =
 
 endif

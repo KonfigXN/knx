@@ -1,7 +1,12 @@
 #include "knx.h"
 
-#define ATA_PRIMARY 0x1f0
-#define ATA_SECONDARY 0x170
+/*
+ * KFS parsing is retained as a fallback filesystem, but the ATA/IDE PIO
+ * controller (ports 0x1f0/0x170/0x3f6) does not exist on AArch64.  The only
+ * disk-read hook is a stub that reports "no media"; the primary root is the
+ * UFS image the UEFI loader passes in memory (see fs_ufs.c / knx_ufs_memdisk).
+ */
+
 #define FS_MAX_FILES 64
 #define SECTOR_SIZE 512
 
@@ -16,55 +21,11 @@ struct fs_entry {
 static struct fs_entry directory[FS_MAX_FILES];
 static unsigned file_count;
 static int mounted;
-static uint16_t ata_base = ATA_PRIMARY;
-static uint16_t ata_control = 0x3f6;
-static uint8_t ata_drive = 0xe0;
-static uint32_t ata_lba_bias;
 
-static inline void outb(uint16_t port, uint8_t value) {
-    __asm__ volatile("outb %0,%1" : : "a"(value), "Nd"(port));
-}
-static inline uint8_t inb(uint16_t port) {
-    uint8_t value;
-    __asm__ volatile("inb %1,%0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-static inline uint16_t inw(uint16_t port) {
-    uint16_t value;
-    __asm__ volatile("inw %1,%0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-
-static int wait_drq(void) {
-    for (unsigned i = 0; i < 1000000; ++i) {
-        uint8_t status = inb(ata_base + 7);
-        if (status == 0 || status == 0xff || (status & 1))
-            return 0;
-        if (!(status & 0x80) && (status & 8))
-            return 1;
-        (void)inb(ata_control);
-    }
-    return 0;
-}
-
-static int ata_read_sector(uint32_t lba, uint8_t *buffer) {
-    if (lba >= (1u << 28) - ata_lba_bias)
-        return 0;
-    lba += ata_lba_bias;
-    outb(ata_base + 6, (uint8_t)(ata_drive | ((lba >> 24) & 0x0f)));
-    for (unsigned i = 0; i < 4; ++i)
-        (void)inb(ata_control);
-    outb(ata_base + 2, 1);
-    outb(ata_base + 3, (uint8_t)lba);
-    outb(ata_base + 4, (uint8_t)(lba >> 8));
-    outb(ata_base + 5, (uint8_t)(lba >> 16));
-    outb(ata_base + 7, 0x20);
-    if (!wait_drq())
-        return 0;
-    uint16_t *words = (uint16_t *)buffer;
-    for (unsigned i = 0; i < 256; ++i)
-        words[i] = inw(ata_base);
-    return 1;
+static int kfs_disk_read(uint32_t lba, uint8_t *buffer) {
+    (void)lba;
+    (void)buffer;
+    return 0; /* No legacy IDE disk on AArch64. */
 }
 
 static int same_name(const char *a, const char *b) {
@@ -178,7 +139,7 @@ static int64_t kfs_read(struct knx_vnode *node, uint64_t offset, void *buffer, u
     uint64_t done = 0;
     while (done < count) {
         uint32_t lba = ent->first_sector + (uint32_t)(done / SECTOR_SIZE);
-        if (!ata_read_sector(lba, sector)) return -1;
+        if (!kfs_disk_read(lba, sector)) return -1;
         uint32_t skip = (uint32_t)(done % SECTOR_SIZE);
         uint32_t take = SECTOR_SIZE - skip;
         if ((uint64_t)take > count - done) take = (uint32_t)(count - done);
@@ -235,65 +196,51 @@ int knx_root_mount_test(void) {
 
 void knx_kfs_init(void) {
     uint8_t sector[SECTOR_SIZE] __attribute__((aligned(16)));
-    volatile uint8_t *sector_clear = sector;
     for (unsigned i = 0; i < SECTOR_SIZE; ++i)
-        sector_clear[i] = 0;
+        sector[i] = 0;
     mounted = 0;
-    for (unsigned device = 0; device < 4; ++device) {
-        ata_base = device < 2 ? ATA_PRIMARY : ATA_SECONDARY;
-        ata_control = device < 2 ? 0x3f6 : 0x376;
-        ata_drive = (device & 1) ? 0xf0 : 0xe0;
-        ata_lba_bias = 0;
-        if (!ata_read_sector(0, sector)) continue;
-        if (sector[510] == 0x55 && sector[511] == 0xaa) {
-            uint32_t part_start = *(uint32_t *)(sector + 454);
-            uint32_t part_size = *(uint32_t *)(sector + 458);
-            if (!part_start || part_size < 16 || part_start >= (1u<<28) || part_size > (1u<<28)-part_start) continue;
-            ata_lba_bias = part_start;
-            if (!ata_read_sector(0, sector)) continue;
+
+    if (!kfs_disk_read(0, sector)) {
+        knx_log("[KFS]", "No IDE disk on AArch64; UFS initrd is the primary root");
+        return;
+    }
+
+    if (sector[510] != 0x4b || sector[511] != 0x58 ||
+        sector[0] != 'K' || sector[1] != 'N' || sector[2] != 'X' || sector[3] != 'F' ||
+        sector[4] != 'S' || sector[5] != '0' || sector[6] != '1')
+        return;
+
+    file_count = *(uint32_t *)(sector + 8);
+    if (file_count > FS_MAX_FILES)
+        return;
+    unsigned copied = 0;
+    int valid = 1;
+    for (uint32_t lba = 1; lba < 9 && copied < file_count; ++lba) {
+        if (!kfs_disk_read(lba, sector)) {
+            valid = 0;
+            break;
         }
-        if (sector[510] != 0x4b || sector[511] != 0x58 ||
-            sector[0] != 'K' || sector[1] != 'N' || sector[2] != 'X' || sector[3] != 'F' ||
-            sector[4] != 'S' || sector[5] != '0' || sector[6] != '1')
-            continue;
-        file_count = *(uint32_t *)(sector + 8);
-        if (file_count > FS_MAX_FILES)
-            continue;
-        unsigned copied = 0;
-        int valid = 1;
-        for (uint32_t lba = 1; lba < 9 && copied < file_count; ++lba) {
-            if (!ata_read_sector(lba, sector)) {
+        for (unsigned i = 0; i < SECTOR_SIZE / sizeof(struct fs_entry) && copied < file_count;
+             ++i, ++copied) {
+            directory[copied] = ((struct fs_entry *)sector)[i];
+            if (directory[copied].name[39] != 0 || directory[copied].first_sector < 16 ||
+                directory[copied].sectors > 2048 ||
+                directory[copied].size > directory[copied].sectors * SECTOR_SIZE ||
+                directory[copied].first_sector >= (1u << 28) ||
+                directory[copied].sectors > (1u << 28) - directory[copied].first_sector) {
                 valid = 0;
                 break;
             }
-            for (unsigned i = 0; i < SECTOR_SIZE / sizeof(struct fs_entry) && copied < file_count;
-                 ++i, ++copied) {
-                directory[copied] = ((struct fs_entry *)sector)[i];
-                if (directory[copied].name[39] != 0 || directory[copied].first_sector < 16 ||
-                    directory[copied].sectors > 2048 ||
-                    directory[copied].size > directory[copied].sectors * SECTOR_SIZE ||
-                    directory[copied].first_sector >= (1u << 28) ||
-                    directory[copied].sectors > (1u << 28) - directory[copied].first_sector) {
-                    valid = 0;
-                    break;
-                }
-            }
-            if (!valid)
-                break;
         }
-        if (valid && copied == file_count) {
-            mounted = 1;
-
-            (void)knx_vfs_mount("/kfs", "kfs", &kfs_vfs_ops, 0);
-            if (ata_lba_bias && knx_vfs_mount("/", "kfs", &kfs_vfs_ops, 0) == 0) {
-                knx_puts("KFS mounted at / (fallback root)\n");
-                knx_puts("KFS mounted at /kfs (fallback)\n");
-            } else {
-                knx_puts("KFS mounted at /kfs (fallback)\n");
-            }
-            return;
-        }
+        if (!valid)
+            break;
     }
+    if (!valid || copied != file_count)
+        return;
+
+    mounted = 1;
+    (void)knx_vfs_mount("/kfs", "kfs", &kfs_vfs_ops, 0);
+    knx_puts("KFS mounted at /kfs (fallback)\n");
 }
 
 int knx_kfs_ready(void) {
@@ -302,7 +249,7 @@ int knx_kfs_ready(void) {
 
 void knx_kfs_list(void) {
     if (!mounted) {
-        knx_puts("No KFS data disk found. Attach build/knx-data.img as an IDE disk.\n");
+        knx_puts("No KFS data disk found. AArch64 uses the UFS initrd as its root.\n");
         return;
     }
     for (unsigned i = 0; i < file_count; ++i) {
@@ -330,7 +277,7 @@ int knx_kfs_cat(const char *name) {
     uint32_t remaining = entry->size;
     uint8_t last = '\n';
     for (uint32_t i = 0; i < entry->sectors && remaining; ++i) {
-        if (!ata_read_sector(entry->first_sector + i, sector))
+        if (!kfs_disk_read(entry->first_sector + i, sector))
             return 0;
         uint32_t take = remaining < SECTOR_SIZE ? remaining : SECTOR_SIZE;
         for (uint32_t j = 0; j < take; ++j) {
@@ -365,7 +312,7 @@ int64_t knx_kfs_read(const char *name, void *buffer, uint64_t capacity) {
     uint32_t remaining = entry->size;
     uint8_t *dst = buffer;
     for (uint32_t i = 0; i < entry->sectors && remaining; ++i) {
-        if (!ata_read_sector(entry->first_sector + i, sector))
+        if (!kfs_disk_read(entry->first_sector + i, sector))
             return -1;
         uint32_t take = remaining < SECTOR_SIZE ? remaining : SECTOR_SIZE;
         for (uint32_t j = 0; j < take; ++j)
