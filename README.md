@@ -6,7 +6,7 @@ This repository contains **the kernel and its boot infrastructure only**. The us
 
 The build system compiles the kernel, BIOS and UEFI bootloaders, and a standalone, kernel-only bootable ISO. No userspace filesystem, root image, or additional data disk is generated.
 
-**License:** GPL-3.0-only. See [COPYING](COPYING).
+**License:** GPL-3.0-only. See [LICENSE](LICENSE).
 
 ---
 
